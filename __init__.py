@@ -1,4 +1,10 @@
 from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+from .ripple_upscale import NODE_CLASS_MAPPINGS as _UPSCALE_CLASSES
+from .ripple_upscale import NODE_DISPLAY_NAME_MAPPINGS as _UPSCALE_NAMES
+
+# Ripple 二采放大节点也挂在这个插件下
+NODE_CLASS_MAPPINGS.update(_UPSCALE_CLASSES)
+NODE_DISPLAY_NAME_MAPPINGS.update(_UPSCALE_NAMES)
 
 WEB_DIRECTORY = "./web"
 
@@ -13,4 +19,4 @@ except Exception as e:  # 接口挂了不影响节点本身可用
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
 
-print("[dogking-tools] 提示词批量加载节点已加载")
+print("[dogking-tools] 已加载：提示词批量加载 / Ripple 二采放大")

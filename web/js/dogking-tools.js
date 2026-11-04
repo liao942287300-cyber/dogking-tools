@@ -6,6 +6,7 @@
  * 3. 按模式动态显示参数：全部生成只留基础项，范围选取才显示起止行，编号选择才显示编号
  * 4. 自动连续：节点执行完如果还有下一行，自动排下一次队列
  * 5. 在节点上显示「第 N/M 行」计数器
+ * 6. Ripple 二采放大：按模式收起没用到的尺寸参数（按倍数 / 按二采像素）
  *
  * 注意：这里用 window.comfyAPI 而不是 import —— 插件放在 web/js/ 下时
  * 相对路径 `../../scripts/app.js` 会解析到 /extensions/scripts/ 而 404，
@@ -17,6 +18,7 @@ const app = comfyAPI.app?.app;
 const api = comfyAPI.api?.api;
 
 const NODE_NAME = "DogkingPromptLoader";
+const NODE_UPSCALE = "DogkingRippleUpscale";
 const EVENT_NEXT = "dogking-tools.next";
 
 if (!app || !api) {
@@ -185,28 +187,100 @@ function boot() {
         onDrawForeground?.apply(this, arguments);
         const text = this.dogkingStatus;
         if (!text || this.flags?.collapsed) return;
+        drawBadge(ctx, this, text);
+      };
+    },
+  });
 
-        ctx.save();
-        ctx.font = "12px ui-monospace, Consolas, monospace";
-        const w = ctx.measureText(text).width;
-        const y = this.size[1] - 10;
-        ctx.fillStyle = "rgba(47, 111, 237, 0.18)";
-        if (typeof ctx.roundRect === "function") {
-          ctx.beginPath();
-          ctx.roundRect(10, y - 14, w + 16, 20, 6);
-          ctx.fill();
-        } else {
-          ctx.fillRect(10, y - 14, w + 16, 20);
+  /* ================= Ripple 二采放大 ================= */
+  // 模式切换：按倍数 / 按二采像素，只显示当前模式用的那个尺寸参数。
+  // 两个都摆着的话分不清到底哪个在生效。
+  app.registerExtension({
+    name: "dogking.tools.rippleUpscale",
+
+    async beforeRegisterNodeDef(nodeType, nodeData) {
+      if (nodeData.name !== NODE_UPSCALE) return;
+
+      const onNodeCreated = nodeType.prototype.onNodeCreated;
+      nodeType.prototype.onNodeCreated = function () {
+        const ret = onNodeCreated?.apply(this, arguments);
+        const node = this;
+        const modeWidget = node.widgets?.find((w) => w.name === "模式");
+
+        if (modeWidget) {
+          const origModeCb = modeWidget.callback;
+          modeWidget.callback = function (value, ...rest) {
+            const r = origModeCb?.apply(this, [value, ...rest]);
+            // combo 的 callback 有时传索引而不是字符串，统一转成实际值
+            let v = value;
+            if (typeof v === "number" && Array.isArray(modeWidget.options?.values)) {
+              v = modeWidget.options.values[v];
+            }
+            applyUpscaleVisibility(node, v ?? modeWidget.value);
+            return r;
+          };
         }
-        ctx.fillStyle = "#5b9bff";
-        ctx.fillText(text, 18, y);
-        ctx.restore();
+
+        applyUpscaleVisibility(node);
+        return ret;
+      };
+
+      // 加载已有工作流后重新摆一次
+      const onConfigure = nodeType.prototype.onConfigure;
+      nodeType.prototype.onConfigure = function () {
+        const r = onConfigure?.apply(this, arguments);
+        setTimeout(() => applyUpscaleVisibility(this), 0);
+        return r;
+      };
+
+      /* ---------------- 执行后在节点上显示放大前后的尺寸 ---------------- */
+      const onExecuted = nodeType.prototype.onExecuted;
+      nodeType.prototype.onExecuted = function (message) {
+        onExecuted?.apply(this, arguments);
+        const text = message?.dogking_size?.[0];
+        if (typeof text === "string") {
+          this.dogkingSize = text;
+          this.setDirtyCanvas?.(true, true);
+        }
+      };
+
+      const onDrawForeground = nodeType.prototype.onDrawForeground;
+      nodeType.prototype.onDrawForeground = function (ctx) {
+        onDrawForeground?.apply(this, arguments);
+        const text = this.dogkingSize;
+        if (!text || this.flags?.collapsed) return;
+        drawBadge(ctx, this, text);
       };
     },
   });
 }
 
 /* ==================================================================== */
+
+/**
+ * 在节点底部画一条小徽标（提示词节点的「第 N/M 行」、放大节点的尺寸都用它）
+ *
+ * @param {CanvasRenderingContext2D} ctx
+ * @param {object} node
+ * @param {string} text
+ */
+function drawBadge(ctx, node, text) {
+  ctx.save();
+  ctx.font = "12px ui-monospace, Consolas, monospace";
+  const w = ctx.measureText(text).width;
+  const y = node.size[1] - 10;
+  ctx.fillStyle = "rgba(47, 111, 237, 0.18)";
+  if (typeof ctx.roundRect === "function") {
+    ctx.beginPath();
+    ctx.roundRect(10, y - 14, w + 16, 20, 6);
+    ctx.fill();
+  } else {
+    ctx.fillRect(10, y - 14, w + 16, 20);
+  }
+  ctx.fillStyle = "#5b9bff";
+  ctx.fillText(text, 18, y);
+  ctx.restore();
+}
 
 /** 记住 widget 原始状态，隐藏时把 type 和高度一起塞掉 */
 function setWidgetVisible(node, widget, visible) {
@@ -249,6 +323,37 @@ function applyModeVisibility(node, modeOverride) {
       // +28 是给底部那条「第 N/M 行」状态条留的空间，
       // 不留的话状态文字会被压在最后一个 widget 下面看不到
       node.setSize([node.size[0], Math.max(h + 28, 148)]);
+      node.setDirtyCanvas?.(true, true);
+    } catch (err) {
+      // 节点还没挂到画布上，忽略
+    }
+  });
+}
+
+/**
+ * Ripple 二采放大：按倍数 → 只显示「放大倍数」；按二采像素 → 只显示「目标百万像素」
+ *
+ * 两个尺寸参数同时摆着的话，用户没法判断到底哪个在生效。
+ *
+ * @param {object} node
+ * @param {string} [modeOverride] 直接用这个模式值（callback 里 widget.value 可能还没更新）
+ */
+function applyUpscaleVisibility(node, modeOverride) {
+  const widgets = node.widgets || [];
+  const find = (name) => widgets.find((w) => w.name === name);
+  const mode = modeOverride ?? find("模式")?.value;
+  const byPixels = mode === "按二采像素";
+
+  setWidgetVisible(node, find("放大倍数"), !byPixels);
+  setWidgetVisible(node, find("目标百万像素"), byPixels);
+
+  // 等一帧让 litegraph 把 widget 高度算进去，再把节点收回去
+  requestAnimationFrame(() => {
+    try {
+      const size = node.computeSize();
+      const h = Number.isFinite(size?.[1]) ? size[1] : 120;
+      // +28 给底部那条「480×864 → 960×1728」留位置
+      node.setSize([node.size[0], Math.max(h + 28, 120)]);
       node.setDirtyCanvas?.(true, true);
     } catch (err) {
       // 节点还没挂到画布上，忽略
