@@ -1,0 +1,17 @@
+# 运行时状态：记录每个节点的阅读进度，含本地文件路径，不入库
+state.json
+state.json.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
+.idea/

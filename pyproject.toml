@@ -1,0 +1,11 @@
+[project]
+name = "dogking-tools"
+description = "ComfyUI 提示词批量加载：读 txt/csv，按全部 / 范围 / 编号三种模式逐行输出"
+version = "1.0.0"
+license = { text = "MIT" }
+dependencies = []
+
+[tool.comfy]
+PublisherId = "dogking"
+DisplayName = "dogking-tools"
+Icon = ""
