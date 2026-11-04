@@ -1,11 +1,19 @@
 [project]
 name = "dogking-tools"
-description = "ComfyUI 提示词批量加载：读 txt/csv，按全部 / 范围 / 编号三种模式逐行输出"
 version = "1.0.0"
-license = { text = "MIT" }
+description = "Batch prompt loader for txt/csv files. Three modes (all lines / range / single index), auto-queues the next run, and resumes interrupted batches."
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
 dependencies = []
+classifiers = [
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Repository = "https://github.com/liao942287300-cyber/dogking-tools"
+"Bug Tracker" = "https://github.com/liao942287300-cyber/dogking-tools/issues"
 
 [tool.comfy]
-PublisherId = "dogking"
-DisplayName = "dogking-tools"
+PublisherId = "liao942287300-cyber"
+DisplayName = "dogking-tools · Prompt Batch Loader"
 Icon = ""
