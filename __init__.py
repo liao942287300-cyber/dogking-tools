@@ -19,4 +19,4 @@ except Exception as e:  # 接口挂了不影响节点本身可用
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
 
-print("[dogking-tools] 已加载：提示词批量加载 / Ripple 二采放大")
+print("[dogking-tools] 已加载：提示词批量加载 / 图片批量加载 / Ripple 二采放大")

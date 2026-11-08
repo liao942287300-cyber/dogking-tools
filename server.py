@@ -1,4 +1,4 @@
-"""dogking-tools 的后端接口：原生文件选择框 + 行数预览 + 重置计数。"""
+"""dogking-tools 的后端接口：原生文件/文件夹选择框 + 行数/图片数预览 + 重置计数。"""
 
 import asyncio
 import sys
@@ -115,6 +115,93 @@ def _ask_file_tk():
             pass
 
 
+def _ask_folder_windows():
+    """
+    Windows 原生「选择文件夹」对话框。
+
+    选文件和选文件夹是两个完全不同的 API：GetOpenFileNameW 只能选文件，
+    选目录必须用 shell32.SHBrowseForFolderW（BROWSEINFOW 结构体）。
+
+    两个必须注意的点：
+      1. pszDisplayName 的类型是 LPWSTR（= ctypes.c_wchar_p）。
+         cast 成 POINTER(c_wchar) 会得到 LP_c_wchar，赋值时报
+         「incompatible types」—— 这个坑踩过一次。
+      2. SHBrowseForFolderW 返回的是 PIDL（指针）。不显式声明 restype 的话
+         ctypes 按默认的 c_int 处理，64 位下高 32 位被截断，后面
+         SHGetPathFromIDListW 直接读坏内存 / 崩溃。所以 restype 必须
+         声明成 c_void_p，用完还要 CoTaskMemFree 释放，否则内存泄漏。
+
+    @returns {str} 选中的文件夹路径；用户取消或失败返回空串
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    BIF_RETURNONLYFSDIRS = 0x0001   # 只能选目录
+    BIF_NEWDIALOGSTYLE = 0x0040     # 新式对话框（可拖动、可新建文件夹）
+
+    class BROWSEINFOW(ctypes.Structure):
+        _fields_ = [
+            ("hwndOwner", wintypes.HWND),
+            ("pidlRoot", ctypes.c_void_p),
+            ("pszDisplayName", wintypes.LPWSTR),
+            ("lpszTitle", wintypes.LPCWSTR),
+            ("ulFlags", wintypes.UINT),
+            ("lpfn", ctypes.c_void_p),
+            ("lParam", wintypes.LPARAM),
+            ("iImage", ctypes.c_int),
+        ]
+
+    shell32 = ctypes.windll.shell32
+    shell32.SHBrowseForFolderW.restype = ctypes.c_void_p
+    shell32.SHBrowseForFolderW.argtypes = [ctypes.POINTER(BROWSEINFOW)]
+    shell32.SHGetPathFromIDListW.restype = wintypes.BOOL
+    shell32.SHGetPathFromIDListW.argtypes = [ctypes.c_void_p, wintypes.LPWSTR]
+
+    buf = ctypes.create_unicode_buffer(1024)
+    bi = BROWSEINFOW()
+    bi.hwndOwner = ctypes.windll.user32.GetForegroundWindow()
+    bi.pszDisplayName = ctypes.cast(buf, ctypes.c_wchar_p)
+    bi.lpszTitle = "选择图片文件夹"
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE
+
+    pidl = shell32.SHBrowseForFolderW(ctypes.byref(bi))
+    if not pidl:
+        # 0 = 用户点了取消
+        return ""
+    try:
+        path_buf = ctypes.create_unicode_buffer(1024)
+        # argtypes 里声明的是 LPWSTR，显式 cast 一下，避免传数组时的类型歧义
+        if not shell32.SHGetPathFromIDListW(pidl, ctypes.cast(path_buf, ctypes.c_wchar_p)):
+            return ""
+        return path_buf.value or ""
+    finally:
+        # PIDL 是 shell 分配的内存，必须还回去
+        try:
+            ctypes.windll.ole32.CoTaskMemFree(ctypes.c_void_p(pidl))
+        except Exception:
+            pass
+
+
+def _ask_folder_tk():
+    """非 Windows 平台的兜底：有 tkinter 就用它选目录。"""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception as e:
+        raise RuntimeError(f"当前环境没有 tkinter：{e}")
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    try:
+        return filedialog.askdirectory(title="选择图片文件夹") or ""
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------- 接口实现
 
 async def select_file(request):
@@ -142,13 +229,63 @@ async def select_file(request):
         _dialog_busy.release()
 
 
+async def select_folder(request):
+    """
+    弹系统原生文件夹选择框，返回选中的路径。
+
+    和 select_file 完全同款：Windows 走线程池（对话框开着的时候
+    ComfyUI 其他请求照常响应），并共用 _dialog_busy 锁 —— 连点两下
+    只会弹一个框，用户不会看到一叠对话框。
+    """
+    global _dialog_busy
+    if not _dialog_busy.acquire(blocking=False):
+        return web.json_response({"path": "", "error": "已经有一个选择框开着，先关掉它"})
+
+    try:
+        if sys.platform == "win32":
+            loop = asyncio.get_running_loop()
+            path = await loop.run_in_executor(None, _ask_folder_windows)
+        else:
+            path = _ask_folder_tk()
+        return web.json_response({"path": path or ""})
+    except Exception as e:
+        return web.json_response({"path": "", "error": str(e)})
+    finally:
+        _dialog_busy.release()
+
+
+async def list_images(request):
+    """
+    返回文件夹里的图片数量和前几个文件名，前端用来显示「共 N 张」。
+
+    body: {"folder": "D:/pics", "sort": "数字升序"}
+    返回: {"total": 120, "preview": [...], "error": null}
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+
+    folder = body.get("folder", "")
+    sort_mode = body.get("sort", "")
+
+    from .nodes import SORT_NUMERIC, count_images
+    return web.json_response(count_images(folder, sort_mode or SORT_NUMERIC))
+
+
 async def count(request):
     """返回文件行数，前端用来在节点上显示「共 N 条」。"""
     try:
         body = await request.json()
     except Exception:
         body = {}
-    path = (body or {}).get("path", "")
+    # body 是字符串 / 数组 / 数字时 .get 会 AttributeError 变成 500，
+    # 和 list_images 一样先收敛成 dict（畸形请求当没填路径处理）
+    if not isinstance(body, dict):
+        body = {}
+    path = body.get("path", "")
 
     from .nodes import count_lines
     return web.json_response(count_lines(path))
@@ -227,7 +364,9 @@ def register_routes():
         return False
 
     _ROUTES.post("/dogking-tools/select_file")(select_file)
+    _ROUTES.post("/dogking-tools/select_folder")(select_folder)
     _ROUTES.post("/dogking-tools/count")(count)
+    _ROUTES.post("/dogking-tools/list_images")(list_images)
     _ROUTES.post("/dogking-tools/reset")(reset)
     return True
 
