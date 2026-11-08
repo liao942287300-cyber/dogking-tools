@@ -1,4 +1,5 @@
-"""dogking-tools 的后端接口：原生文件/文件夹选择框 + 行数/图片数预览 + 重置计数。"""
+"""dogking-tools 的后端接口：原生文件/文件夹选择框 + 行数/图片数预览 + 重置计数
++ PromptVault 分类代转（浏览器跨源调不到 PromptVault，只能由后端中转）。"""
 
 import asyncio
 import sys
@@ -342,11 +343,42 @@ async def reset(request):
     return web.json_response({"ok": True, "all": True})
 
 
+# ---------------------------------------------------------------- PromptVault
+
+async def pv_categories(request):
+    """
+    返回 PromptVault 的分类路径列表，前端用来填「分类」下拉框。
+
+    为什么不让前端直接调 PromptVault：那边的服务只监听 127.0.0.1，而且
+    刻意不发 Access-Control-Allow-Origin（防止任意网页读到本地数据），
+    浏览器会拦掉跨源响应。所以只能由 ComfyUI 后端代转一次。
+
+    body: {"addr": "127.0.0.1:8766"}（留空 = 自动发现 8765-8775）
+    返回: {"ok": true, "categories": [{"path": "风格", "id": "...", "level": 1}]}
+          连不上时 {"ok": false, "error": "PromptVault 未运行（试过 8765-8775）..."}
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    # 畸形请求（字符串 / 数组 / 数字）一律当「没填地址」处理
+    if not isinstance(body, dict):
+        body = {}
+    addr = body.get("addr", "")
+
+    from .pv_nodes import list_category_paths
+
+    # 网络请求最长 3 秒，绝不能放在事件循环里同步跑，否则 ComfyUI 整个假死
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, list_category_paths, addr)
+    return web.json_response(result)
+
+
 # ---------------------------------------------------------------- 注册
 
 def register_routes():
     """
-    把上面三个接口挂到 ComfyUI 的 aiohttp 路由表上。
+    把上面这些接口挂到 ComfyUI 的 aiohttp 路由表上。
 
     ComfyUI 正常启动时 PromptServer.instance 一定存在；但加载顺序或测试环境下
     它可能是 None，这时返回 False，由调用方决定要不要重试。
@@ -368,6 +400,7 @@ def register_routes():
     _ROUTES.post("/dogking-tools/count")(count)
     _ROUTES.post("/dogking-tools/list_images")(list_images)
     _ROUTES.post("/dogking-tools/reset")(reset)
+    _ROUTES.post("/dogking-tools/pv_categories")(pv_categories)
     return True
 
 

@@ -1,6 +1,9 @@
 # 运行时状态：记录每个节点的阅读进度，含本地文件路径，不入库
 state.json
 state.json.tmp
+# PromptVault 分类列表缓存（PromptVault 没开时兜底用）
+pv_categories_cache.json
+pv_categories_cache.json.tmp
 
 # Python
 __pycache__/

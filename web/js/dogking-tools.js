@@ -20,6 +20,8 @@ const api = comfyAPI.api?.api;
 const NODE_NAME = "DogkingPromptLoader";
 const NODE_UPSCALE = "DogkingRippleUpscale";
 const NODE_IMAGE = "DogkingImageLoader";
+/** PromptVault 数据源节点（提示词 / 图片 / 图片+提示词 / 词库） */
+const PV_NODES = ["DogkingPVPrompt", "DogkingPVImage", "DogkingPVPair", "DogkingPVText"];
 const EVENT_NEXT = "dogking-tools.next";
 /** 图片节点拖拽区高度（px）。DOM widget 靠它算尺寸，太小节点会塌 */
 const DROP_HEIGHT = 220;
@@ -477,6 +479,114 @@ function boot() {
       };
     },
   });
+
+  /* ================= PromptVault 数据源节点 ×4 ================= */
+  // 分类下拉 + 三种模式的参数显隐 + 重置计数 + 底部状态条。
+  //
+  // 分类列表不能由浏览器直接向 PromptVault 要：那边只监听回环、且刻意不发
+  // CORS 头（防止任意网页读本地数据），浏览器会拦掉跨源响应。
+  // 所以走 ComfyUI 后端代转：/dogking-tools/pv_categories。
+  app.registerExtension({
+    name: "dogking.tools.pvNodes",
+
+    async beforeRegisterNodeDef(nodeType, nodeData) {
+      if (!PV_NODES.includes(nodeData.name)) return;
+
+      const onNodeCreated = nodeType.prototype.onNodeCreated;
+      nodeType.prototype.onNodeCreated = function () {
+        const ret = onNodeCreated?.apply(this, arguments);
+        const node = this;
+        const find = (name) => node.widgets?.find((w) => w.name === name);
+
+        node.dogkingStatus = "";
+
+        /* ---------------- 换服务地址 → 重新拉分类 ---------------- */
+        const addrWidget = find("服务地址");
+        if (addrWidget) {
+          const origAddrCb = addrWidget.callback;
+          addrWidget.callback = function (value, ...rest) {
+            const r = origAddrCb?.apply(this, [value, ...rest]);
+            refreshPvCategories(node, value);
+            return r;
+          };
+        }
+
+        /* ---------------- 按模式显示参数（三种模式） ---------------- */
+        const modeWidget = find("模式");
+        if (modeWidget) {
+          const origModeCb = modeWidget.callback;
+          modeWidget.callback = function (value, ...rest) {
+            const r = origModeCb?.apply(this, [value, ...rest]);
+            // combo 的 callback 有时传索引而不是字符串，统一转成实际值
+            let v = value;
+            if (typeof v === "number" && Array.isArray(modeWidget.options?.values)) {
+              v = modeWidget.options.values[v];
+            }
+            applyPvModeVisibility(node, v ?? modeWidget.value);
+            return r;
+          };
+        }
+
+        /* ---------------- 重置计数按钮 ---------------- */
+        const contWidget = find("自动连续");
+        const resetBtn = node.addWidget("button", "重置计数", null, async () => {
+          try {
+            const res = await api.fetchApi("/dogking-tools/reset", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ node: String(node.id) }),
+            });
+            const data = await res.json();
+            if (data?.ok) {
+              node.dogkingStatus = "计数已重置（下次从第一条开始）";
+              node.setDirtyCanvas?.(true, true);
+            } else {
+              alert("重置失败：" + (data?.error || "未知错误"));
+            }
+          } catch (err) {
+            alert("重置请求失败：" + err);
+          }
+        });
+        moveWidgetAfter(node, resetBtn, contWidget);
+
+        /* ---------------- 初始摆位 + 拉分类 ---------------- */
+        applyPvModeVisibility(node);
+        refreshPvCategories(node);
+        return ret;
+      };
+
+      /* ---------------- 加载已有工作流后重新摆一次 ---------------- */
+      const onConfigure = nodeType.prototype.onConfigure;
+      nodeType.prototype.onConfigure = function () {
+        const r = onConfigure?.apply(this, arguments);
+        setTimeout(() => {
+          applyPvModeVisibility(this);
+          refreshPvCategories(this);
+        }, 0);
+        return r;
+      };
+
+      /* ---------------- 执行后更新状态条 ---------------- */
+      const onExecuted = nodeType.prototype.onExecuted;
+      nodeType.prototype.onExecuted = function (message) {
+        onExecuted?.apply(this, arguments);
+        const status = message?.dogking_status?.[0];
+        if (typeof status === "string") {
+          this.dogkingStatus = status;
+          this.setDirtyCanvas?.(true, true);
+        }
+      };
+
+      /* ---------------- 在节点底部画状态条 ---------------- */
+      const onDrawForeground = nodeType.prototype.onDrawForeground;
+      nodeType.prototype.onDrawForeground = function (ctx) {
+        onDrawForeground?.apply(this, arguments);
+        const text = this.dogkingStatus;
+        if (!text || this.flags?.collapsed) return;
+        drawBadge(ctx, this, text);
+      };
+    },
+  });
 }
 
 /* ==================================================================== */
@@ -739,6 +849,112 @@ function applyImageModeVisibility(node, modeOverride) {
       // 节点还没挂到画布上，忽略
     }
   });
+}
+
+/* ==================== PromptVault 节点相关工具 ==================== */
+
+/**
+ * 全部模式 → 只留服务地址 / 分类 / 模式 / 自动连续
+ * 范围模式 → 多出 起始序号 / 结束序号
+ * 编号模式 → 多出 编号
+ *
+ * 注意这里要认三种模式（图片节点只认「范围模式」和「全部模式」两种）。
+ *
+ * @param {object} node
+ * @param {string} [modeOverride] 直接用这个模式值（callback 里 widget.value 可能还没更新）
+ */
+function applyPvModeVisibility(node, modeOverride) {
+  const widgets = node.widgets || [];
+  const find = (name) => widgets.find((w) => w.name === name);
+  const mode = modeOverride ?? find("模式")?.value;
+
+  const isRange = mode === "范围模式";
+  const isIndex = mode === "编号模式";
+
+  setWidgetVisible(node, find("起始序号"), isRange);
+  setWidgetVisible(node, find("结束序号"), isRange);
+  setWidgetVisible(node, find("编号"), isIndex);
+
+  // 等一帧让 litegraph 把 widget 高度算进去，再重设节点尺寸
+  requestAnimationFrame(() => {
+    try {
+      const size = node.computeSize();
+      const h = Number.isFinite(size?.[1]) ? size[1] : 160;
+      // +28 给底部状态条留位置，不留的话文字会被压在最后一个 widget 下面
+      node.setSize([Math.max(node.size[0], 300), Math.max(h + 28, 180)]);
+      node.setDirtyCanvas?.(true, true);
+    } catch (err) {
+      // 节点还没挂到画布上，忽略
+    }
+  });
+}
+
+/**
+ * 拉 PromptVault 的分类路径，填进「分类」下拉框。
+ *
+ * 走 ComfyUI 后端代转（/dogking-tools/pv_categories）——
+ * PromptVault 只监听回环且不发 CORS 头，浏览器直接 fetch 会被拦掉。
+ *
+ * @param {object} node
+ * @param {string} [addrOverride] 直接用这个服务地址（callback 里 widget.value 可能还没更新）
+ */
+async function refreshPvCategories(node, addrOverride) {
+  const widgets = node.widgets || [];
+  const catWidget = widgets.find((w) => w.name === "分类");
+  if (!catWidget) return;
+
+  const addrWidget = widgets.find((w) => w.name === "服务地址");
+  const addr = addrOverride ?? addrWidget?.value ?? "";
+
+  try {
+    const res = await api.fetchApi("/dogking-tools/pv_categories", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ addr: String(addr || "") }),
+    });
+    const data = await res.json();
+    if (!data?.ok) {
+      // 拉不到：**不动**现有选项和当前值，只在节点底部提示。
+      // 否则打开一个 PromptVault 没开时保存的工作流，用户选的分类会被悄悄清成「全部」。
+      applyPvCategoryValues(node, null, "PromptVault 未连接");
+      return;
+    }
+    const paths = (data.categories || [])
+      .map((c) => c?.path)
+      .filter((p) => typeof p === "string" && p.trim());
+    applyPvCategoryValues(node, paths.length ? paths : ["全部"], "");
+  } catch (err) {
+    applyPvCategoryValues(node, null, "PromptVault 未连接");
+  }
+}
+
+/**
+ * 写入分类下拉的候选值。
+ *
+ * 改完 options.values 必须 setDirtyCanvas，否则界面还是老的列表；
+ * 当前值如果已经不在新列表里（分类被删 / 换了 PromptVault），重置成「全部」。
+ *
+ * @param {object} node
+ * @param {string[]|null} values 新候选值；传 null 表示「这次没拉到，保持原样」
+ * @param {string} statusText 非空时同时更新底部状态条
+ */
+function applyPvCategoryValues(node, values, statusText) {
+  const catWidget = (node.widgets || []).find((w) => w.name === "分类");
+  if (!catWidget) return;
+
+  if (Array.isArray(values) && values.length) {
+    if (!catWidget.options) catWidget.options = {};
+    catWidget.options.values = values.slice();
+
+    if (!values.includes(catWidget.value)) catWidget.value = values[0] || "全部";
+  }
+
+  if (statusText) {
+    node.dogkingStatus = statusText;
+  } else if (node.dogkingStatus === "PromptVault 未连接") {
+    node.dogkingStatus = "";
+  }
+  node.setDirtyCanvas?.(true, true);
 }
 
 /** 手动列表里的相对路径 → /view 地址（缩略图用） */
