@@ -1,0 +1,183 @@
+%% dogking-tools v2 · 类图（数据结构与接口）
+%% 对应 docs/ARCH-comfyui-nodes-v2.md §4.1
+%% 已按 T04 落地后的实际代码逐条核对（2025-11 复核）
+
+classDiagram
+    direction LR
+
+    class PvClient {
+        <<module pv_client.py>>
+        +str NODE_DIR
+        +tuple PORT_CANDIDATES
+        +float TIMEOUT
+        +float PROBE_TIMEOUT
+        +reset_caches() void
+        +clear_data_cache() void
+        +resolve_base(addr) str
+        +fetch_categories(addr) tuple
+        +fetch_items(addr, category_id, search, ids, include_children) tuple
+        +fetch_items_by_ids(addr, ids) tuple
+        +fetch_text(addr, text_type) tuple
+        +fetch_assets(addr, category, project, q, limit, offset, ids) tuple
+        +fetch_assets_by_ids(addr, ids) tuple
+        +fetch_image_bytes(addr, image_id, size) tuple
+        +fetch_asset_image(addr, asset_id, size) tuple
+        +build_category_paths(categories) list
+        +category_id_from_path(path, categories) str
+        +resolve_category_id(addr, top, sub) str
+        +list_category_paths(addr) dict
+        +category_choices(addr) list
+        +asset_facet_choices(addr) dict
+        +tensor_from_bytes(data) tuple
+        +sniff_image_mime(data) str
+    }
+
+    class PvStore {
+        <<module pv_store.py>>
+        +float SLIM_TTL = 120
+        +float SEARCH_TTL = 60
+        +float FULL_TTL = 600
+        +int FULL_MAX = 2000
+        +int THUMB_MAX = 256
+        +int MAX_PAGE_SIZE = 500
+        +dict _slim
+        +dict _search
+        +OrderedDict _full_by_id
+        +OrderedDict _thumb
+        +norm_addr(addr) str
+        +get_slim(kind, addr, refresh, filters) tuple
+        +search_haystack(kind, addr, filters) dict
+        +page(items, q, page, page_size, haystack) dict
+        +sample_random(kind, addr, n, exclude, q, filters) list
+        +lookup_images(addr, ids) tuple
+        +lookup_text(addr, text_type, ids) tuple
+        +lookup_assets(addr, ids) tuple
+        +thumb(kind, addr, item_id, size) tuple
+        +invalidate(addr) void
+        +stats() dict
+    }
+
+    class PvNodes {
+        <<module pv_nodes.py>>
+        +str PV2_KIND = pv2
+        +str ALL_CATEGORY
+        +list PICK_MODES
+        +list OUT_MODES
+        +list TEXT_TYPES
+        +dict TEXT_TYPE_KEYS
+        +int MAX_ONESHOT = 32
+        +int WARN_ONESHOT = 8
+        +_split_choices(addr) tuple
+        +_category_suffix(top, sub) str
+        +_parse_sel(raw) dict
+        +_sel_hash(ids) str
+        +_stack_images(images) tuple_batch_padded
+        +advance_pick_state(key, sel_hash, total) tuple
+        +notify_next(key, line, total, more, auto) void
+        +_load_one(addr, image_id) tuple
+        +_item_text(item) tuple
+        +_result(payload, status) dict
+    }
+
+    class DogkingPVPick {
+        +tuple RETURN_TYPES
+        +tuple RETURN_NAMES
+        +str FUNCTION = load
+        +INPUT_TYPES() dict
+        +IS_CHANGED(kwargs) float
+        +load(addr, cat, sub, pick_mode, out_mode, rand_n, auto, selected, unique_id) dict
+        -_queued(addr, ids, valid, by_id, cat_part, missing_n, auto, unique_id, note) dict
+        -_one_shot(addr, valid, by_id, cat_part, missing_n) dict
+        -_fail(message) dict
+    }
+
+    class DogkingPVVault {
+        +tuple RETURN_TYPES
+        +INPUT_TYPES() dict
+        +load(addr, text_type, selected, unique_id) dict
+        -_fail(message) dict
+    }
+
+    class DogkingPVAsset {
+        +tuple RETURN_TYPES
+        +INPUT_TYPES() dict
+        +load(addr, category, project, selected, unique_id) dict
+        -_fail(message) dict
+    }
+
+    class DogkingPVAssets {
+        +int MAX_IMAGE_PORTS = 8
+        +tuple RETURN_TYPES
+        +tuple RETURN_NAMES
+        +INPUT_TYPES() dict
+        +load(addr, category, project, out_mode, selected, unique_id) dict
+        -_fail(message) dict
+    }
+
+    class StateRecord {
+        <<state.json entry · kind=pv2>>
+        +str kind = pv2
+        +str sel
+        +int index
+        +int total
+        +int ts
+    }
+
+    class SelectionPayload {
+        <<「已选」widget JSON · 平行数组>>
+        +list ids
+        +list names
+    }
+
+    class PanelPayload {
+        <<pv_list 响应>>
+        +bool ok
+        +int total
+        +int page
+        +int pageSize
+        +int pages
+        +str addr
+        +int tookMs
+        +list items
+    }
+
+    class PvPanel {
+        <<module web/js/lib/panel.js>>
+        +object node
+        +str kind
+        +str view
+        +str mode
+        +int pageSize
+        +int maxSelect
+        +fn randomCount
+        +fn filters
+        +list order
+        +Set selected
+        +int page
+        +mount() void
+        +reload(page) Promise
+        +setSelection(items) void
+        +toggle(id) void
+        +rangeSelect(id) void
+        +confirm() void
+        +setFilters() void
+        +destroy() void
+    }
+
+    PvStore ..> PvClient : 缓存未命中时拉取（列表 / 索引源 / 按 id）
+    DogkingPVPick ..> PvNodes : _result / advance_pick_state / _stack_images
+    DogkingPVPick ..> PvStore : get_slim / sample_random / lookup_images
+    DogkingPVVault ..> PvStore : get_slim(text) / lookup_text
+    DogkingPVAsset ..> PvStore : get_slim(asset) / lookup_assets
+    DogkingPVAssets ..> PvStore : get_slim(asset) / lookup_assets
+    DogkingPVAsset ..> PvClient : fetch_asset_image（原图字节）
+    DogkingPVAssets ..> PvClient : fetch_asset_image（原图字节）
+    DogkingPVAssets ..> PvNodes : _stack_images / _result
+    PvNodes ..> StateRecord : 读写
+    DogkingPVPick ..> SelectionPayload : 序列化
+    PvStore ..> PanelPayload : 组装
+    PvPanel ..> PanelPayload : 消费
+    DogkingPVPick ..> PvPanel : 挂载（内嵌 DOM widget）
+    DogkingPVVault ..> PvPanel : 挂载
+    DogkingPVAsset ..> PvPanel : 挂载
+    DogkingPVAssets ..> PvPanel : 挂载

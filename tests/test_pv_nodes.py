@@ -1,559 +1,570 @@
 # -*- coding: utf-8 -*-
 """
-PromptVault 节点测试：分类路径 / 三种模式推进 / 数据源指纹 / 断线兜底 / 请求参数
+pv_nodes.py 测试（节点 1 图片+提示词 / 节点 2 词库）
 
-HTTP 全部打桩（替换 urllib.request.urlopen），不依赖真实 PromptVault，
-也不碰用户真实的 state.json。
+**这份文件是重写的**：旧版测的是 `_iterate` / `_advance` / `source_key`，
+那些函数在 v2 已经全部删除，所以旧版必然全红。
+
+组织方式：**按「出口」分组**，不按功能点分组。
+功能点列法会漏掉「功能看起来对、但某条 early return 走错了」的情况
+（T04 的 P0-1 就是这么漏的：单个 id 失效那条路测了，整体失败那条路没测）。
+
+本文件的每个 `test_*` 都能被 pytest 收集，也可以直接 `python tests/test_pv_nodes.py` 跑。
+HTTP 全部打桩，状态文件用临时目录，**不碰用户真实 state.json**。
 """
+
 import importlib.util
-import io
 import json
-import math
 import os
+import re
 import sys
 import tempfile
-import urllib.error
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 插件根目录
 
-# 先加载 nodes.py（pv_nodes 的 state 读写来自它）
-spec = importlib.util.spec_from_file_location("dk_nodes_pv", os.path.join(HERE, "nodes.py"))
-nodes = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(nodes)
 
-# 用临时状态文件，绝对不碰用户真实的 state.json
-tmpdir = tempfile.mkdtemp()
-nodes.STATE_FILE = os.path.join(tmpdir, "state.json")
+# ---------------------------------------------------------------- 模块加载
+#
+# 加载顺序有讲究：pv_nodes 里写的是 `import pv_client`（独立加载时的兜底分支），
+# 所以必须**先把自己的 pv_client 实例注册进 sys.modules**，否则 pv_nodes 会从磁盘
+# 再导入一份新的，我的桩就打不上了。
+#
+# 每个测试文件都这样做，保证各自的模块实例互不污染（pytest 是同一个进程）。
 
-# pv_nodes 里写的是 `from .nodes import ...`；独立加载时走兜底 `from nodes import ...`，
-# 所以先把已加载的模块注册成 "nodes"
-sys.modules["nodes"] = nodes
-
-spec2 = importlib.util.spec_from_file_location("dk_pv_nodes", os.path.join(HERE, "pv_nodes.py"))
-pv = importlib.util.module_from_spec(spec2)
-spec2.loader.exec_module(pv)
-
-# 分类缓存也指到临时目录，别写进插件目录
-pv.CATEGORY_CACHE_FILE = os.path.join(tmpdir, "pv_categories_cache.json")
-
-PASS, FAIL, SKIP = [], [], []
+def _load(name, alias):
+    spec = importlib.util.spec_from_file_location(alias, os.path.join(HERE, name + ".py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
-def check(name, got, want):
-    ok = got == want
-    (PASS if ok else FAIL).append(name)
-    print(f"{'PASS' if ok else 'FAIL'} {name}")
-    if not ok:
-        print(f"     期望: {want}")
-        print(f"     实际: {got}")
+_nodes = _load("nodes", "dk_nodes_for_pv_nodes")
+sys.modules["nodes"] = _nodes
+# 状态文件指到临时目录：绝不写用户真实的 state.json
+_TMPDIR = tempfile.mkdtemp(prefix="dk_pv_nodes_")
+_nodes.STATE_FILE = os.path.join(_TMPDIR, "state.json")
+
+pv_client = _load("pv_client", "dk_pv_client_for_pv_nodes")
+sys.modules["pv_client"] = pv_client
+# 缓存文件也指到临时目录
+pv_client.CATEGORY_CACHE_FILE = os.path.join(_TMPDIR, "pv_categories_cache.json")
+pv_client.ASSETS_CACHE_FILE = os.path.join(_TMPDIR, "pv_assets_cache.json")
+
+pv = _load("pv_nodes", "dk_pv_nodes")
+
+# ---- 绑定自检（防止多个测试文件互相覆盖 sys.modules 时"悄悄拿错实例"）----
+#
+# 背景：四个测试文件各自加载一份 nodes / pv_client / pv_nodes 实例，并临时占用
+# `sys.modules["nodes"]` / `["pv_client"]` 这两个**共享键**（因为生产代码里写的是
+# `from nodes import ...` / `import pv_client`，绕不开）。
+#
+# 正确性依赖一个隐含不变量：**每个文件在 import 依赖之前，先把共享键指向自己的实例**。
+# 这个不变量一旦被破坏（比如将来有人新增测试文件时顺序写反），症状会是
+# 「某个测试莫名其妙红」（例如游标期望 4 得到 1），和源码 bug 长得一模一样，极难排查。
+#
+# 所以在 import 期就把"我拿到的确实是我加载的那份"断言出来 —— 出问题时是
+# 一条清晰的 ImportError 式报错，而不是一个令人困惑的测试失败。
+assert pv._load_state.__module__ == _nodes.__name__, \
+    f"pv_nodes 的 _load_state 来自 {pv._load_state.__module__}，不是本文件的 {_nodes.__name__}"
+assert pv._blank_image.__module__ == _nodes.__name__, \
+    "pv_nodes 的 _blank_image 不是本文件加载的 nodes 实例"
 
 
-def check_true(name, cond, detail=""):
-    ok = bool(cond)
-    (PASS if ok else FAIL).append(name)
-    print(f"{'PASS' if ok else 'FAIL'} {name}")
-    if not ok:
-        print(f"     详情: {detail}")
+# ---------------------------------------------------------------- 打桩
 
+class _Assets:
+    """可变的假资产库：id → {name, positive, negative, params, h, w, fill}。"""
 
-def skip(name, why):
-    SKIP.append(name)
-    print(f"SKIP {name}（{why}）")
+    def __init__(self):
+        self.items = {}
+        self.down = False          # True = 模拟 PromptVault 未运行
+        self.fetch_error = None    # 非空 = 模拟接口报错
 
+    def reset(self):
+        self.items.clear()
+        self.down = False
+        self.fetch_error = None
 
-# ---------------------------------------------------------------- HTTP 打桩
-
-class FakeResp:
-    def __init__(self, payload):
-        self._payload = payload
-
-    def read(self):
-        return self._payload
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-
-CALLS = []
-ROUTES = {}
-_real_open = pv._open
-
-
-def fake_open(req, timeout=None):
-    url = req.full_url if hasattr(req, "full_url") else str(req)
-    CALLS.append(url)
-    path = url.split("?")[0]
-    for suffix, value in ROUTES.items():
-        if path.endswith(suffix):
-            if isinstance(value, Exception):
-                raise value
-            if isinstance(value, bytes):
-                return FakeResp(value)
-            return FakeResp(json.dumps(value, ensure_ascii=False).encode("utf-8"))
-    raise urllib.error.URLError("no route")
-
-
-pv._open = fake_open
-
-CATEGORIES = [
-    {"id": "c1", "name": "风格", "level": 1, "parentId": None, "order": 0},
-    {"id": "c1a", "name": "写实摄影", "level": 2, "parentId": "c1", "order": 0},
-    {"id": "c1b", "name": "动漫插画", "level": 2, "parentId": "c1", "order": 1},
-    {"id": "c2", "name": "主体", "level": 1, "parentId": None, "order": 1},
-    {"id": "c2a", "name": "人物", "level": 2, "parentId": "c2", "order": 0},
-]
-
-
-def make_items(count=5):
-    return [
-        {
-            "id": f"img{i}",
-            "name": f"图{i}",
-            "positive": f"正向{i}",
-            "negative": f"负向{i}",
-            "params": f"Steps: {i}, CFG: 7",
-            "tags": ["古风"],
-            "categoryId": "c1",
-            "width": 64,
-            "height": 64,
-            "createdAt": 1730000000000 + i,
+    def add(self, item_id, name="", h=48, w=64, fill=0.5):
+        self.items[item_id] = {
+            "id": item_id, "name": name or item_id,
+            "positive": "正向-" + item_id, "negative": "", "params": "参数-" + item_id,
+            "h": h, "w": w, "fill": fill,
         }
-        for i in range(1, count + 1)
-    ]
+
+    # --- 打桩用的函数 ---
+    def fetch_items_by_ids(self, addr="", ids=None):
+        if self.down:
+            return None, list(ids or []), "PromptVault 未运行（试过 8765-8775），请先打开 PromptVault"
+        if self.fetch_error:
+            return None, list(ids or []), self.fetch_error
+        got = [i for i in (ids or []) if i in self.items]
+        items = [{k: v for k, v in self.items[i].items() if k not in ("h", "w", "fill")} for i in got]
+        return items, [i for i in (ids or []) if i not in self.items], None
+
+    def fetch_image_bytes(self, addr="", image_id="", size="full"):
+        if self.down:
+            return None, "PromptVault 未运行（试过 8765-8775），请先打开 PromptVault"
+        if image_id not in self.items:
+            return None, "HTTP 404"
+        return b"fake-bytes", None
+
+    def tensor_from_bytes(self, data):
+        import torch
+        # 用「当前正在解码的 id」决定尺寸/填充值，让每张图可区分
+        spec = self.items.get(self._decoding, {"h": 48, "w": 64, "fill": 0.5})
+        return torch.full((1, spec["h"], spec["w"], 3), float(spec["fill"]), dtype=torch.float32), None
+
+    def fetch_text(self, addr="", text_type="loras"):
+        if self.down:
+            return None, "PromptVault 未运行（试过 8765-8775），请先打开 PromptVault"
+        return [
+            {"id": "t1", "name": "姬紫月", "text": "触发词内容"},
+            {"id": "t2", "name": "空触发词", "text": ""},
+        ], None
 
 
-TEXT_ITEMS = [
-    {"id": "l1", "name": "角色A", "text": "charA, 1girl, solo"},
-    {"id": "l2", "name": "角色B", "text": "charB, 1boy"},
-    {"id": "l3", "name": "角色C", "text": "charC, 1other"},
-]
-
-try:
-    from PIL import Image as _PILImage
-    _buf = io.BytesIO()
-    _PILImage.new("RGB", (12, 8), (10, 20, 30)).save(_buf, format="PNG")
-    PNG_BYTES = _buf.getvalue()
-    HAS_PIL = True
-except Exception:
-    PNG_BYTES = b"\x89PNG\r\n\x1a\nbroken"
-    HAS_PIL = False
+ASSETS = _Assets()
+ASSETS._decoding = ""
 
 
-def routes(items=None, categories=None, text=None, image=PNG_BYTES):
-    """装一套默认可用的接口响应"""
-    ROUTES.clear()
-    ROUTES.update({
-        "/api/health": {"ok": True, "app": "PromptVault", "version": "1.1.9", "counts": {}},
-        "/api/categories": {
-            "ok": True,
-            "categories": CATEGORIES if categories is None else categories,
-        },
-        "/api/items": {
-            "ok": True,
-            "total": len(make_items(5) if items is None else items),
-            "items": make_items(5) if items is None else items,
-        },
-        "/api/text": {"ok": True, "items": TEXT_ITEMS if text is None else text},
-        "/api/image": image,
-    })
-    CALLS.clear()
-    pv.reset_caches()
+def _install_stubs():
+    """把桩装到 pv_nodes 真正使用的 pv_client 实例上。"""
+    pv.pv_client.fetch_items_by_ids = ASSETS.fetch_items_by_ids
+    pv.pv_client.fetch_image_bytes = ASSETS.fetch_image_bytes
+    pv.pv_client.tensor_from_bytes = ASSETS.tensor_from_bytes
+    pv.pv_client.fetch_text = ASSETS.fetch_text
+    # _load_one 里先用 fetch_image_bytes 再 tensor_from_bytes，
+    # 用 _load_one 包一层只是为了记录「正在解码哪个 id」，让每张图可区分
+    pv._load_one = _load_one
 
 
-def run_prompt(mode="全部模式", start=1, end=0, idx=1, cat="全部", addr="",
-               node="pv_prompt", auto=True):
-    r = pv.DogkingPVPrompt().load(addr, cat, mode, start, end, idx, auto, unique_id=node)
-    positive, negative, params, line, total, status = r["result"]
-    return positive, negative, params, line, total, status
+def _load_one(addr, image_id):
+    import torch
+    if ASSETS.down:
+        return pv._blank_image(), "PromptVault 未运行（试过 8765-8775），请先打开 PromptVault"
+    spec = ASSETS.items.get(image_id)
+    if spec is None:
+        return pv._blank_image(), "HTTP 404"
+    return torch.full((1, spec["h"], spec["w"], 3), float(spec["fill"]), dtype=torch.float32), None
 
 
-def run_image(mode="全部模式", start=1, end=0, idx=1, cat="全部", addr="",
-              node="pv_image", auto=True):
-    r = pv.DogkingPVImage().load(addr, cat, mode, start, end, idx, auto, unique_id=node)
-    image, line, total, status = r["result"]
-    return image, line, total, status
+_install_stubs()
 
 
-def run_pair(mode="全部模式", start=1, end=0, idx=1, cat="全部", addr="",
-             node="pv_pair", auto=True):
-    r = pv.DogkingPVPair().load(addr, cat, mode, start, end, idx, auto, unique_id=node)
-    image, positive, negative, params, line, total, status = r["result"]
-    return image, positive, negative, params, line, total, status
+def sel(*ids):
+    """构造前端写进隐藏 widget 的清单。"""
+    return json.dumps({"ids": list(ids), "names": [ASSETS.items.get(i, {}).get("name", "") for i in ids]})
 
 
-def run_text(kind="LORA触发词", mode="全部模式", start=1, end=0, idx=1, cat="全部",
-             addr="", node="pv_text", auto=True):
-    r = pv.DogkingPVText().load(addr, cat, kind, mode, start, end, idx, auto, unique_id=node)
-    content, name, line, total, status = r["result"]
-    return content, name, line, total, status
+def fresh_state():
+    """每个用例开始前清空状态文件，避免游标互相干扰。"""
+    try:
+        os.remove(_nodes.STATE_FILE)
+    except OSError:
+        pass
 
 
-# ================================================================ 1. 分类路径
-print("=== 1. 分类路径构建（扁平 → 路径）===")
-routes()
-paths = pv.build_category_paths(CATEGORIES)
-check("路径顺序（一级在前，其子级紧随）",
-      [p["path"] for p in paths],
-      ["全部", "风格", "风格/写实摄影", "风格/动漫插画", "主体", "主体/人物"])
-check("第一项是「全部」且 id 为空", (paths[0]["path"], paths[0]["id"]), ("全部", ""))
-check("二级分类 level = 2", paths[2]["level"], 2)
+def status_of(result):
+    """
+    状态文案 —— 它**不再占输出口**，走 `ui.dogking_status`（前端画在节点底部）。
 
-print("\n=== 2. 路径反查 id ===")
-check("反查一级", pv.category_id_from_path("风格", CATEGORIES), "c1")
-check("反查二级", pv.category_id_from_path("风格/写实摄影", CATEGORIES), "c1a")
-check("「全部」→ 空（不筛选）", pv.category_id_from_path("全部", CATEGORIES), "")
-check("空字符串 → 空", pv.category_id_from_path("", CATEGORIES), "")
-check("不存在的路径 → 空", pv.category_id_from_path("不存在/xx", CATEGORIES), "")
-check("脏数据（None）→ 空", pv.category_id_from_path(None, CATEGORIES), "")
+    输出口精简成 (图片, 正向) 之后，所有「第 N/M 张」「N 张已失效」这类信息
+    都只能从这里取。这也是这次改动最容易漏测的地方：输出口断言全绿，
+    但提示文案悄悄没了。
+    """
+    return result["ui"]["dogking_status"][0]
 
-print("\n=== 3. 孤儿二级分类不丢 ===")
-orphan_cats = CATEGORIES + [{"id": "x9", "name": "孤儿分类", "level": 2,
-                             "parentId": "gone", "order": 0}]
-orphan_paths = [p["path"] for p in pv.build_category_paths(orphan_cats)]
-check_true("父分类已删的二级分类追加在末尾", "孤儿分类" in orphan_paths, orphan_paths)
-check("孤儿分类排在最后", orphan_paths[-1], "孤儿分类")
 
-print("\n=== 4. 空 / 脏分类数据不炸 ===")
-check("空列表 → 只剩全部", [p["path"] for p in pv.build_category_paths([])], ["全部"])
-check("None → 只剩全部", [p["path"] for p in pv.build_category_paths(None)], ["全部"])
-check("元素是字符串 → 只剩全部",
-      [p["path"] for p in pv.build_category_paths(["a", "b"])], ["全部"])
+def index_of(result):
+    """从状态条里解析排队游标「第 3/12 张」→ (3, 12)。"""
+    m = re.search(r"第 (\d+)/(\d+) 张", status_of(result))
+    assert m, f"状态条里没有游标：{status_of(result)!r}"
+    return int(m.group(1)), int(m.group(2))
 
-# ================================================================ 5. 三种模式
-print("\n=== 5. 全部模式：5 条 → 1,2,3,4,5,1 ===")
-routes()
-seq = [run_prompt(node="pv_all")[3] for _ in range(6)]
-check("序号序列", seq, [1, 2, 3, 4, 5, 1])
 
-print("\n=== 6. 范围模式 2-4 → 2,3,4,2 ===")
-routes()
-seq = [run_prompt(mode="范围模式", start=2, end=4, node="pv_range")[3] for _ in range(4)]
-check("序号序列", seq, [2, 3, 4, 2])
+# ================================================================ _parse_sel
 
-print("\n=== 7. 范围模式反填 4-2 → 自动纠正成 2-4 ===")
-routes()
-seq = [run_prompt(mode="范围模式", start=4, end=2, node="pv_rev")[3] for _ in range(4)]
-check("序号序列", seq, [2, 3, 4, 2])
+def test_parse_sel_accepts_three_formats():
+    """前端实际存 {ids,names}，架构文档写的是对象数组，两种都得吃。"""
+    assert pv._parse_sel('{"ids":["a1","a2"],"names":["图1","图2"]}') == {
+        "ids": ["a1", "a2"], "names": ["图1", "图2"]}
+    assert pv._parse_sel('[{"id":"a1","name":"图1"}]') == {"ids": ["a1"], "names": ["图1"]}
+    assert pv._parse_sel('["a1","a2"]')["ids"] == ["a1", "a2"]
 
-print("\n=== 8. 范围模式超范围 1-999 → clamp 到 5 ===")
-routes()
-seq = [run_prompt(mode="范围模式", start=1, end=999, node="pv_clamp")[3] for _ in range(6)]
-check("序号序列", seq, [1, 2, 3, 4, 5, 1])
 
-print("\n=== 9. 范围模式 结束序号=0 → 表示到最后 ===")
-routes()
-seq = [run_prompt(mode="范围模式", start=3, end=0, node="pv_end0")[3] for _ in range(3)]
-check("序号序列", seq, [3, 4, 5])
+def test_parse_sel_rejects_dirty_input_without_raising():
+    """脏数据一律收敛成空清单 —— 这个函数每次执行都跑，抛异常等于节点永久不可用。"""
+    for raw in ("", None, "   ", "{not json", "123", "null", '{"ids":"不是数组"}'):
+        assert pv._parse_sel(raw) == {"ids": [], "names": []}, f"输入 {raw!r} 应得空清单"
 
-print("\n=== 10. 编号模式：固定第 3 条，不推进 ===")
-routes()
-seq = [run_prompt(mode="编号模式", idx=3, node="pv_index")[3] for _ in range(3)]
-check("序号序列", seq, [3, 3, 3])
-check_true("编号模式状态文案带序号", run_prompt(mode="编号模式", idx=3, node="pv_index")[5]
-           .startswith("第 3/5 条（编号模式 3）"), "")
 
-print("\n=== 11. 编号模式超范围 clamp ===")
-routes()
-check("编号 999 → 取最后一条", run_prompt(mode="编号模式", idx=999, node="pv_idx_clamp")[3], 5)
+def test_parse_sel_dedupes_and_skips_items_without_id():
+    assert pv._parse_sel('["a1","a2","a1"]')["ids"] == ["a1", "a2"]
+    assert pv._parse_sel('[{"name":"没有id"},{"id":"a1"}]')["ids"] == ["a1"]
 
-# ================================================================ 12. 指纹
-print("\n=== 12. 换分类 → 计数归零 ===")
-routes()
-run_prompt(cat="风格", node="pv_src")
-run_prompt(cat="风格", node="pv_src")
-check("同分类第 3 次是第 3 条", run_prompt(cat="风格", node="pv_src")[3], 3)
-check("换分类后回到第 1 条", run_prompt(cat="主体", node="pv_src")[3], 1)
 
-print("\n=== 13. 换服务地址 → 计数归零 ===")
-routes()
-run_prompt(addr="127.0.0.1:8765", node="pv_addr")
-run_prompt(addr="127.0.0.1:8765", node="pv_addr")
-check("同地址第 3 次是第 3 条",
-      run_prompt(addr="127.0.0.1:8765", node="pv_addr")[3], 3)
-check("换地址后回到第 1 条",
-      run_prompt(addr="127.0.0.1:8766", node="pv_addr")[3], 1)
+# ================================================================ _sel_hash
 
-print("\n=== 14. 换词库类型 → 计数归零 ===")
-routes()
-run_text("LORA触发词", node="pv_type")
-run_text("LORA触发词", node="pv_type")
-check("同类型第 3 次是第 3 条", run_text("LORA触发词", node="pv_type")[2], 3)
-check("换类型后回到第 1 条", run_text("编辑指令", node="pv_type")[2], 1)
+def test_sel_hash_is_stable_and_order_sensitive():
+    h = pv._sel_hash(["a1", "a2"])
+    assert len(h) == 12
+    assert h == pv._sel_hash(["a1", "a2"])
+    # 顺序变了就是另一份清单（节点 4 的输出口顺序有意义）
+    assert h != pv._sel_hash(["a2", "a1"])
+    assert h != pv._sel_hash(["a1", "a3"])
 
-print("\n=== 15. 换模式不清零（和老节点一致：模式不算数据源）===")
-routes()
-run_prompt(mode="全部模式", node="pv_mode")
-check("切到范围模式仍从第 1 条开始（index 已推进到 1）",
-      run_prompt(mode="范围模式", start=1, end=5, node="pv_mode")[3], 2)
 
-# ================================================================ 16. 断线
-print("\n=== 16. PromptVault 未运行：不抛异常、状态正确 ===")
-ROUTES.clear()
-CALLS.clear()
-pv.reset_caches()
-positive, negative, params, line, total, status = run_prompt(node="pv_down")
-check("状态串", status, pv.NOT_RUNNING)
-check("序号归零", line, 0)
-check("总数归零", total, 0)
-check("正向为空", positive, "")
+def test_sel_hash_empty_list():
+    assert len(pv._sel_hash([])) == 12
 
-image, line, total, status = run_image(node="pv_down_img")
-check("图片节点状态串", status, pv.NOT_RUNNING)
-check_true("图片节点仍返回占位图或 None", image is None or hasattr(image, "shape"), type(image))
-check("图片节点序号归零", line, 0)
 
-print("\n=== 17. 手动填了地址时，提示里带上地址 ===")
-ROUTES.clear()
-pv.reset_caches()
-status = run_prompt(addr="127.0.0.1:9999", node="pv_down_addr")[5]
-check_true("提示含自定义地址", "127.0.0.1:9999" in status, status)
-check_true("提示含「未运行」", "未运行" in status, status)
+# ================================================================ _stack_images
 
-print("\n=== 18. 接口返回 500：给 HTTP 状态，不假装没开 ===")
-routes()
-ROUTES["/api/items"] = urllib.error.HTTPError("http://x", 500, "boom", None, None)
-pv.reset_caches()
-status = run_prompt(node="pv_500")[5]
-check_true("状态里带 HTTP 500", "HTTP 500" in status, status)
+def _img(h, w, fill=0.5):
+    import torch
+    return torch.full((1, h, w, 3), float(fill), dtype=torch.float32)
 
-print("\n=== 19. 响应不是 JSON 对象：不炸 ===")
-routes()
-ROUTES["/api/items"] = b"[1,2,3]"
-pv.reset_caches()
-status = run_prompt(node="pv_badjson")[5]
-check_true("有可读的错误提示", "格式不对" in status, status)
 
-# ================================================================ 20. 空列表
-print("\n=== 20. 分类下没有图片 ===")
-routes(items=[])
-status = run_image(node="pv_empty")[3]
-check("状态串", status, "该分类下没有图片")
-check("总数", run_image(node="pv_empty")[2], 0)
+def test_stack_images_same_size():
+    batch, padded = pv._stack_images([_img(48, 64), _img(48, 64), _img(48, 64)])
+    assert tuple(batch.shape) == (3, 48, 64, 3)
+    assert padded == 0
 
-routes(text=[])
-check("词库为空的状态串", run_text(node="pv_empty_text")[4], "该类型下没有内容")
 
-print("\n=== 21. 分类不存在（分类被删了）===")
-routes()
-status = run_image(cat="已经删掉的分类", node="pv_nocat")[3]
-check_true("提示分类不存在", "分类不存在" in status, status)
-check_true("词库节点忽略分类（不会因此报错）",
-           "分类不存在" not in run_text(cat="已经删掉的分类", node="pv_text_cat")[4],
-           run_text(cat="已经删掉的分类", node="pv_text_cat")[4])
+def test_stack_images_empty_returns_gray_not_none():
+    """空列表必须返回灰图 —— 返回 None 会让下游崩。"""
+    batch, padded = pv._stack_images([])
+    assert batch is not None
+    assert tuple(batch.shape)[0] == 1
+    assert padded == 0
 
-# ================================================================ 22. 图片
-print("\n=== 22. 图片下载失败：灰图 + 状态带原因，不打断队列 ===")
-routes()
-ROUTES["/api/image"] = urllib.error.URLError("refused")
-pv.reset_caches()
-image, line, total, status = run_image(node="pv_img_fail")
-check_true("状态里带「图片下载失败」", "图片下载失败" in status, status)
-check("序号仍然推进", line, 1)
-check_true("返回占位图或 None", image is None or hasattr(image, "shape"), type(image))
 
-routes()
-ROUTES["/api/image"] = b"this is not an image"
-pv.reset_caches()
-image, line, total, status = run_image(node="pv_img_bad")
-check_true("坏图也有原因", "图片下载失败" in status and "读取失败" in status, status)
+def test_stack_images_letterbox_pads_and_counts():
+    """尺寸差 >2% 走补边分支，并计入 padded。"""
+    batch, padded = pv._stack_images([_img(100, 200), _img(100, 100)])
+    assert tuple(batch.shape) == (2, 100, 200, 3)
+    assert padded == 1
 
-print("\n=== 23. 图片下载成功：tensor 形状 [1,H,W,3] ===")
-routes()
-image, line, total, status = run_image(node="pv_img_ok")
-if HAS_PIL:
-    check("序号", line, 1)
-    check("总数", total, 5)
-    check_true("状态文案", status.startswith("第 1/5 张（全部模式 1-5）"), status)
-    if image is not None and hasattr(image, "shape"):
-        check("形状（12×8 的图 → 1,8,12,3）", tuple(image.shape), (1, 8, 12, 3))
-        check("dtype", str(image.dtype), "torch.float32")
-    else:
-        skip("图片 tensor 形状", "当前环境没有 torch")
-else:
-    skip("图片 tensor 形状", "当前环境没有 PIL")
 
-print("\n=== 24. 图片+提示词节点：图和词一一对应 ===")
-routes()
-image, positive, negative, params, line, total, status = run_pair(node="pv_pair")
-check("正向", positive, "正向1")
-check("负向", negative, "负向1")
-check("参数", params, "Steps: 1, CFG: 7")
-check("序号", line, 1)
-image, positive, negative, params, line, total, status = run_pair(node="pv_pair")
-check("第 2 次取第 2 条", (line, positive), (2, "正向2"))
+def test_stack_images_ratio_within_2_percent_does_not_pad():
+    """宽高比差 <2% → 直接 resize，不补边（1024×1530 对 1024×1536 只差 0.39%）。"""
+    _, padded = pv._stack_images([_img(1536, 1024), _img(1530, 1024)])
+    assert padded == 0
 
-# ================================================================ 25. 请求参数
-print("\n=== 25. 选一级分类必须带 includeChildren=1 ===")
-routes()
-run_image(cat="风格", node="pv_param_children")
-item_urls = [u for u in CALLS if "/api/items" in u]
-check_true("发过 /api/items 请求", len(item_urls) >= 1, CALLS)
-check_true("URL 里带 includeChildren=1",
-           any("includeChildren=1" in u for u in item_urls), item_urls)
-check_true("URL 里带 category=c1",
-           any("category=c1" in u for u in item_urls), item_urls)
-check_true("URL 里带 type=images",
-           any("type=images" in u for u in item_urls), item_urls)
 
-print("\n=== 26. 选「全部」时不传 category ===")
-routes()
-run_image(cat="全部", node="pv_param_all")
-item_urls = [u for u in CALLS if "/api/items" in u]
-check_true("没有 category 参数", all("category=" not in u for u in item_urls), item_urls)
-check_true("没有 includeChildren 参数",
-           all("includeChildren" not in u for u in item_urls), item_urls)
+def test_stack_images_pure_scale_counts_zero_padding():
+    """
+    纯等比放大（512×768 → 1024×1536）比例差为 0 → 走 resize 分支，
+    **不能**被计入「已补边」—— 一个像素都没补，状态条不能撒谎。
+    """
+    batch, padded = pv._stack_images([_img(1536, 1024), _img(768, 512)])
+    assert tuple(batch.shape) == (2, 1536, 1024, 3)
+    assert padded == 0
 
-print("\n=== 27. 二级分类：路径反查成子分类 id ===")
-routes()
-run_image(cat="风格/写实摄影", node="pv_param_sub")
-item_urls = [u for u in CALLS if "/api/items" in u]
-check_true("URL 里带 category=c1a",
-           any("category=c1a" in u for u in item_urls), item_urls)
 
-print("\n=== 28. 词库类型映射到正确的接口参数 ===")
-routes()
-run_text("LORA触发词", node="pv_t1")
-check_true("loras", any("type=loras" in u for u in CALLS if "/api/text" in u), CALLS)
-routes()
-run_text("编辑指令", node="pv_t2")
-check_true("edits", any("type=edits" in u for u in CALLS if "/api/text" in u), CALLS)
-routes()
-run_text("系统提示词", node="pv_t3")
-check_true("system-prompts",
-           any("type=system-prompts" in u for u in CALLS if "/api/text" in u), CALLS)
+def test_stack_images_padding_uses_edge_replicate_not_black():
+    """
+    补边用边缘复制而不是黑边：黑条是高对比区域，会被 VAE 当成图像内容编码。
+    用非均匀图验证（全 0 假图分不出 replicate 和 constant）。
+    """
+    import torch
+    base = torch.full((1, 100, 200, 3), 0.2)
+    base[:, :, 0, :] = 0.9     # 左边缘
+    base[:, :, -1, :] = 0.7    # 右边缘
+    narrow = torch.full((1, 100, 100, 3), 0.2)
+    narrow[:, :, 0, :] = 0.9
+    narrow[:, :, -1, :] = 0.7
 
-print("\n=== 29. 词库节点输出内容 / 名称 ===")
-routes()
-content, name, line, total, status = run_text("LORA触发词", node="pv_t_out")
-check("内容 = text 字段", content, "charA, 1girl, solo")
-check("名称 = name 字段", name, "角色A")
-check("序号", line, 1)
-check("总数", total, 3)
+    batch, padded = pv._stack_images([base, narrow])
+    assert padded == 1
+    row = batch[1, 50]
+    assert torch.allclose(row[0], row[50]), "左填充应等于缩放后的左边缘"
+    assert not torch.allclose(row[0], torch.zeros(3)), "填充不能是黑的"
 
-print("\n=== 30. 显式服务地址：不探测 8765-8775 ===")
-routes()
-run_image(addr="127.0.0.1:8766", node="pv_explicit")
-check_true("所有请求都打向指定地址",
-           all(u.startswith("http://127.0.0.1:8766/") for u in CALLS), CALLS)
-check_true("没有探过别的端口", not any(":8765/" in u for u in CALLS), CALLS)
 
-print("\n=== 31. 自动发现：并发探测 + 结果进程内缓存 ===")
-routes()
-run_image(node="pv_cache1")
-after_first = len([u for u in CALLS if "/api/health" in u])
-run_image(node="pv_cache2")
-after_second = len([u for u in CALLS if "/api/health" in u])
-check("第二次执行不再探测（进程内缓存生效）", after_second, after_first)
-check_true("发现的是 8765（按端口号顺序取第一个，不是按完成顺序）",
-           pv.resolve_base("") == "http://127.0.0.1:8765", pv._cached_base)
+# ================================================================ advance_pick_state
 
-print("\n=== 32. 1 秒内重复拉 items 只发一次请求 ===")
-routes()
-pv.fetch_items("", "c1")
-pv.fetch_items("", "c1")
-check("items 只请求 1 次", len([u for u in CALLS if "/api/items" in u]), 1)
-pv.fetch_items("", "c2")
-check("换分类会重新请求", len([u for u in CALLS if "/api/items" in u]), 2)
+def test_advance_first_call_starts_at_one():
+    fresh_state()
+    index, total, more = pv.advance_pick_state("k1", "hashA", 3)
+    assert (index, total, more) == (1, 3, True)
 
-# ================================================================ 33. 结构
-print("\n=== 33. 四个节点的 INPUT_TYPES / RETURN_TYPES 结构 ===")
-EXPECTED = {
-    "DogkingPVPrompt": (("STRING", "STRING", "STRING", "INT", "INT", "STRING"),
-                        ("正向", "负向", "参数", "当前序号", "总数", "状态")),
-    "DogkingPVImage": (("IMAGE", "INT", "INT", "STRING"),
-                       ("图片", "当前序号", "总数", "状态")),
-    "DogkingPVPair": (("IMAGE", "STRING", "STRING", "STRING", "INT", "INT", "STRING"),
-                      ("图片", "正向", "负向", "参数", "当前序号", "总数", "状态")),
-    "DogkingPVText": (("STRING", "STRING", "INT", "INT", "STRING"),
-                      ("内容", "名称", "当前序号", "总数", "状态")),
-}
-routes()
-for node_name, (types, names) in EXPECTED.items():
-    cls = pv.NODE_CLASS_MAPPINGS[node_name]
-    check(f"{node_name} RETURN_TYPES", tuple(cls.RETURN_TYPES), types)
-    check(f"{node_name} RETURN_NAMES", tuple(cls.RETURN_NAMES), names)
-    check(f"{node_name} FUNCTION", cls.FUNCTION, "load")
-    check(f"{node_name} OUTPUT_NODE", cls.OUTPUT_NODE, True)
-    check(f"{node_name} CATEGORY", cls.CATEGORY, "dogking-tools")
 
-    it = cls.INPUT_TYPES()
-    req = it.get("required", {})
-    for key in ("服务地址", "分类", "模式", "起始序号", "结束序号", "编号", "自动连续"):
-        check_true(f"{node_name} 有输入「{key}」", key in req, list(req.keys()))
-    check(f"{node_name} hidden.unique_id", it.get("hidden", {}).get("unique_id"), "UNIQUE_ID")
+def test_advance_consecutive_then_wraps():
+    fresh_state()
+    seq = [pv.advance_pick_state("k2", "hashA", 3)[0] for _ in range(4)]
+    assert seq == [1, 2, 3, 1], "跑完一轮应归零回第 1 张"
 
-    cat_opts = req["分类"][0]
-    check_true(f"{node_name} 分类是列表且含「全部」",
-               isinstance(cat_opts, list) and "全部" in cat_opts, cat_opts)
-    check(f"{node_name} 模式候选", list(req["模式"][0]), ["全部模式", "范围模式", "编号模式"])
 
-check("文本节点有「类型」输入",
-      list(pv.DogkingPVText.INPUT_TYPES()["required"].get("类型", ([],))[0]),
-      ["LORA触发词", "编辑指令", "系统提示词"])
-check_true("非文本节点没有「类型」",
-           "类型" not in pv.DogkingPVImage.INPUT_TYPES()["required"])
+def test_advance_fingerprint_change_resets():
+    fresh_state()
+    pv.advance_pick_state("k3", "hashA", 3)
+    pv.advance_pick_state("k3", "hashA", 3)
+    index, _, _ = pv.advance_pick_state("k3", "hashB", 3)
+    assert index == 1, "换清单（指纹变）必须归零"
 
-print("\n=== 34. IS_CHANGED 强制每次执行 ===")
-for node_name in EXPECTED:
-    value = pv.NODE_CLASS_MAPPINGS[node_name].IS_CHANGED()
-    check_true(f"{node_name} 返回 NaN",
-               isinstance(value, float) and math.isnan(value), value)
 
-print("\n=== 35. 显示名统一格式 ===")
-for node_name in EXPECTED:
-    display = pv.NODE_DISPLAY_NAME_MAPPINGS[node_name]
-    check_true(f"{node_name} 显示名", display.startswith("PromptVault ") and "dogking-tools" in display,
-               display)
+def test_advance_does_not_inherit_old_kind():
+    """旧 kind="image" 的记录是图片批量加载节点写的，绝不能被 PV 节点继承。"""
+    fresh_state()
+    _nodes._save_state({"k4": {"kind": "image", "folder": "x", "index": 5}})
+    index, _, _ = pv.advance_pick_state("k4", "hashA", 3)
+    assert index == 1
 
-# ================================================================ 36. 兼容
-print("\n=== 36. 老节点的 state 记录不会被 PromptVault 节点误用 ===")
-routes()
-old = nodes._load_state()
-old["pv_legacy"] = {"path": "x.txt", "mode": "全部生成", "index": 9}
-old["pv_legacy_img"] = {"kind": "image", "folder": "d", "sort": "数字升序",
-                        "mode": "全部模式", "index": 9}
-nodes._save_state(old)
-check("无 kind 的记录当无记录", run_prompt(node="pv_legacy")[3], 1)
-check("kind=image 的记录当无记录", run_image(node="pv_legacy_img")[1], 1)
 
-print("\n=== 37. PromptVault 节点自己的记录格式 ===")
-routes()
-run_prompt(node="pv_record")
-saved = nodes._load_state()
-rec = saved.get("pv_record", {})
-check("kind = pv", rec.get("kind"), "pv")
-check("index = 1", rec.get("index"), 1)
-check_true("source 里带服务地址标识", str(rec.get("source", "")).startswith("auto|"), rec.get("source"))
-check("source = auto||（自动发现 + 全部分类 + 无类型）", rec.get("source"), "auto||")
+def test_advance_zero_total_is_safe():
+    fresh_state()
+    assert pv.advance_pick_state("k5", "hashA", 0) == (0, 0, False)
 
-routes()
-run_prompt(cat="风格", node="pv_record2")
-check("选了分类时 source 带分类 id",
-      nodes._load_state().get("pv_record2", {}).get("source"), "auto|c1|")
 
-print("\n=== 38. 重置计数后从第 1 条开始 ===")
-routes()
-run_prompt(node="pv_reset")
-run_prompt(node="pv_reset")
-state = nodes._load_state()
-state["pv_reset"]["index"] = 0
-nodes._save_state(state)
-check("重置后回到第 1 条", run_prompt(node="pv_reset")[3], 1)
+# ================================================================ 节点 1：出口 1（空清单）
 
-print("\n=== 39. 状态串格式（提示词用「条」，图片用「张」）===")
-routes()
-check("提示词状态串", run_prompt(node="pv_fmt")[5], "第 1/5 条（全部模式 1-5）")
-routes()
-check("图片状态串", run_image(node="pv_fmt_img")[3], "第 1/5 张（全部模式 1-5）")
+def test_pick_empty_selection():
+    fresh_state()
+    r = pv.DogkingPVPick().load(已选="")
+    payload = r["result"]
+    assert len(payload) == 2, "输出口只剩 (图片, 正向)"
+    assert payload[1] == "", "空清单时正向是空串"
+    assert status_of(r) == "未选择图片"
+    assert payload[0] is not None, "空清单也要给灰图，不能返回 None"
 
-# 恢复真实请求入口（同一进程里可能还有别的测试）
-pv._open = _real_open
 
-print("\n" + "=" * 50)
-print(f"通过 {len(PASS)} / 失败 {len(FAIL)} / 跳过 {len(SKIP)}")
-if FAIL:
-    print("失败项:", FAIL)
-    sys.exit(1)
+# ================================================================ 节点 1：出口 2（整体失败）
+
+def test_pick_promptvault_down_returns_gray_and_message():
+    """整体失败路径：不能抛异常、不能返回 None。"""
+    fresh_state()
+    ASSETS.reset()
+    ASSETS.add("a1")
+    ASSETS.down = True
+    try:
+        r = pv.DogkingPVPick().load(已选=sel("a1"))
+        payload = r["result"]
+        assert len(payload) == 2
+        assert "未运行" in status_of(r)
+        assert payload[0] is not None
+        assert payload[1] == ""
+    finally:
+        ASSETS.down = False
+
+
+def test_pick_interface_error_returns_message():
+    fresh_state()
+    ASSETS.reset()
+    ASSETS.add("a1")
+    ASSETS.fetch_error = "接口返回 HTTP 500"
+    try:
+        r = pv.DogkingPVPick().load(已选=sel("a1"))
+        assert "500" in status_of(r)
+    finally:
+        ASSETS.fetch_error = None
+
+
+# ================================================================ 节点 1：出口 3（一次性）
+
+def test_pick_oneshot_batch_and_texts():
+    fresh_state()
+    ASSETS.reset()
+    for i in ("a1", "a2", "a3"):
+        ASSETS.add(i)
+    r = pv.DogkingPVPick().load(已选=sel("a1", "a2", "a3"), 输出方式="一次性全部输出")
+    assert len(r["result"]) == 2, "输出口只剩 图片 + 正向（负向/参数/序号/总数/状态已删）"
+    img, pos = r["result"]
+    assert tuple(img.shape) == (3, 48, 64, 3)
+    assert pos == "正向-a1\n\n正向-a2\n\n正向-a3", "正向按空行拼接"
+    assert "已输出 3 张" in status_of(r), "张数信息不能丢，只是改走状态条"
+
+
+def test_pick_oneshot_over_limit_degrades_with_verbatim_message():
+    """
+    超过 32 张必须降级为排队，**并且逐字告知** —— 不许静默切换、不许截断、不许报错。
+    """
+    fresh_state()
+    ASSETS.reset()
+    many = [f"m{i}" for i in range(50)]
+    for i in many:
+        ASSETS.add(i)
+    r = pv.DogkingPVPick().load(已选=json.dumps({"ids": many}), 输出方式="一次性全部输出", unique_id="k_over")
+    payload = r["result"]
+    assert tuple(payload[0].shape) == (1, 48, 64, 3), "降级后只出 1 张"
+    status = status_of(r)
+    assert "清单 50 张超过一次性输出上限（32），已自动改为排队输出（本次输出第 1 张）" in status
+    # 游标仍在状态条里（原来靠「当前序号 / 总数」两个输出口，现在没有那两个口了）
+    assert index_of(r) == (1, 50)
+
+
+def test_pick_oneshot_exactly_32_still_oneshot():
+    fresh_state()
+    ASSETS.reset()
+    ids = [f"e{i}" for i in range(32)]
+    for i in ids:
+        ASSETS.add(i)
+    r = pv.DogkingPVPick().load(已选=json.dumps({"ids": ids}), 输出方式="一次性全部输出", unique_id="k_32")
+    assert tuple(r["result"][0].shape) == (32, 48, 64, 3)
+    assert "已自动改为排队" not in status_of(r)
+
+
+# ================================================================ 节点 1：出口 4（排队）
+
+def test_pick_queue_cycles():
+    fresh_state()
+    ASSETS.reset()
+    for i in ("a1", "a2", "a3"):
+        ASSETS.add(i)
+    seq = [index_of(pv.DogkingPVPick().load(
+        已选=sel("a1", "a2", "a3"), 输出方式="排队输出", unique_id="k_q"))[0]
+        for _ in range(4)]
+    assert seq == [1, 2, 3, 1]
+    r = pv.DogkingPVPick().load(已选=sel("a1", "a2", "a3"), 输出方式="排队输出", unique_id="k_q")
+    assert tuple(r["result"][0].shape) == (1, 48, 64, 3)
+    assert r["result"][1] == "正向-a2", "正向跟着游标走"
+
+
+def test_pick_queue_deleted_item_does_not_reset_or_emit_gray():
+    """
+    清单 12 张、其中 2 张在 PromptVault 里被删：
+      · 指纹用原始清单 → 游标不归零
+      · 范围用有效清单 → 只跑 10 步，尾部**不吐灰帧**
+    """
+    fresh_state()
+    ASSETS.reset()
+    ids = [f"t{i}" for i in range(1, 13)]
+    for i in ids:
+        ASSETS.add(i)
+    del ASSETS.items["t11"]
+    del ASSETS.items["t12"]
+
+    seen = []
+    for _ in range(12):
+        r = pv.DogkingPVPick().load(已选=json.dumps({"ids": ids}), 输出方式="排队输出", unique_id="k_del")
+        idx, tot = index_of(r)
+        seen.append((idx, tot, tuple(r["result"][0].shape)))
+
+    assert all(tot == 10 for _, tot, _ in seen), "总数应为有效张数 10"
+    assert all(shape != (1, 64, 64, 3) for _, _, shape in seen), "不该出现灰帧"
+    assert sorted({idx for idx, _, _ in seen}) == list(range(1, 11))
+
+
+def test_pick_queue_cursor_continues_after_middle_deletion():
+    """删掉清单里的一张，游标应继续推进而不是回到 1。"""
+    fresh_state()
+    ASSETS.reset()
+    five = [f"a{i}" for i in range(1, 6)]
+    for i in five:
+        ASSETS.add(i)
+    seq = [index_of(pv.DogkingPVPick().load(
+        已选=json.dumps({"ids": five}), 输出方式="排队输出", unique_id="k_mid"))[0]
+        for _ in range(3)]
+    assert seq == [1, 2, 3]
+    del ASSETS.items["a5"]
+    nxt = index_of(pv.DogkingPVPick().load(
+        已选=json.dumps({"ids": five}), 输出方式="排队输出", unique_id="k_mid"))
+    assert nxt[0] == 4, "游标应继续到 4，不是回到 1"
+
+
+# ================================================================ 节点 1：出口 5（部分失效）
+
+def test_pick_partial_missing_reports_and_skips():
+    fresh_state()
+    ASSETS.reset()
+    for i in ("a1", "a2"):
+        ASSETS.add(i)
+    r = pv.DogkingPVPick().load(已选=sel("a1", "zzz", "a2"), 输出方式="一次性全部输出")
+    assert tuple(r["result"][0].shape) == (2, 48, 64, 3), "失效的那张应被跳过（不出灰帧）"
+    assert "已输出 2 张" in status_of(r)
+    assert "1 张已失效" in status_of(r)
+
+
+def test_pick_all_missing_returns_gray_with_message():
+    fresh_state()
+    ASSETS.reset()
+    r = pv.DogkingPVPick().load(已选=json.dumps({"ids": ["zzz1", "zzz2"]}), 输出方式="排队输出")
+    assert "已失效" in status_of(r)
+    assert r["result"][0] is not None, "全部失效也要给灰图"
+
+
+# ================================================================ 节点 2
+
+def test_vault_single_selection():
+    ASSETS.reset()
+    r = pv.DogkingPVVault().load(已选=json.dumps({"ids": ["t1"], "names": ["姬紫月"]}))
+    assert r["result"] == ("触发词内容",), "词库只输出「内容」一个口"
+    # 名称不再占输出口，但必须能在状态条里看到（否则用户不知道取的是哪一条）
+    assert "姬紫月" in status_of(r)
+
+
+def test_vault_empty_text_is_reported():
+    ASSETS.reset()
+    r = pv.DogkingPVVault().load(已选=json.dumps({"ids": ["t2"]}))
+    assert "内容为空" in status_of(r)
+
+
+def test_vault_empty_selection():
+    r = pv.DogkingPVVault().load(已选="")
+    assert r["result"] == ("",)
+    assert status_of(r) == "未选择词条"
+
+
+def test_vault_missing_item():
+    ASSETS.reset()
+    r = pv.DogkingPVVault().load(已选=json.dumps({"ids": ["nope"]}))
+    assert "已失效" in status_of(r)
+
+
+def test_vault_multi_selection_truncates_with_note():
+    """只支持单选，但清单里有多条时必须说明，不能静默截断。"""
+    ASSETS.reset()
+    r = pv.DogkingPVVault().load(已选=json.dumps({"ids": ["t1", "t2"]}))
+    assert "仅支持单选" in status_of(r)
+    assert "共选 2 条" in status_of(r)
+
+
+def test_vault_promptvault_down():
+    ASSETS.reset()
+    ASSETS.down = True
+    try:
+        r = pv.DogkingPVVault().load(已选=json.dumps({"ids": ["t1"]}))
+        assert "未运行" in status_of(r)
+    finally:
+        ASSETS.down = False
+
+
+# ================================================================ 注册映射
+
+def test_node_mappings_only_two_nodes():
+    """v1 的 4 个节点已硬删，这里只应剩 2 个。"""
+    assert set(pv.NODE_CLASS_MAPPINGS) == {"DogkingPVPick", "DogkingPVVault"}
+
+
+def test_pick_return_types():
+    """用户要求：节点 1 只留「图片 + 正向」。"""
+    assert pv.DogkingPVPick.RETURN_TYPES == ("IMAGE", "STRING")
+    assert pv.DogkingPVPick.RETURN_NAMES == ("图片", "提示词")
+
+
+def test_vault_return_types():
+    """用户要求：节点 2 只留「内容」。"""
+    assert pv.DogkingPVVault.RETURN_TYPES == ("STRING",)
+    assert pv.DogkingPVVault.RETURN_NAMES == ("内容",)
+
+
+# ---------------------------------------------------------------- 直接运行入口
+
+if __name__ == "__main__":
+    failed = []
+    passed = 0
+    for name, fn in sorted(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            try:
+                fn()
+                passed += 1
+                print(f"PASS {name}")
+            except Exception as exc:  # noqa: BLE001 - 测试入口要抓住所有异常
+                failed.append((name, exc))
+                print(f"FAIL {name}: {exc}")
+    print("\n" + "=" * 50)
+    print(f"通过 {passed} / 失败 {len(failed)}")
+    if failed:
+        print("失败项:", [n for n, _ in failed])
+        sys.exit(1)

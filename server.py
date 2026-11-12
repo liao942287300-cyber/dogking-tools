@@ -1,5 +1,10 @@
 """dogking-tools 的后端接口：原生文件/文件夹选择框 + 行数/图片数预览 + 重置计数
-+ PromptVault 分类代转（浏览器跨源调不到 PromptVault，只能由后端中转）。"""
++ PromptVault 代转（浏览器跨源调不到 PromptVault，只能由后端中转）。
+
+PromptVault 相关接口分两批：
+  · v1：pv_categories（分类下拉）
+  · v2：pv_list / pv_meta / pv_thumb / pv_random（面板的分页/元数据/缩略图/随机）
+"""
 
 import asyncio
 import sys
@@ -345,6 +350,40 @@ async def reset(request):
 
 # ---------------------------------------------------------------- PromptVault
 
+async def _read_json_body(request):
+    """
+    读请求体并收敛成 dict。
+
+    畸形请求（字符串 / 数组 / 数字 / 空 body）一律当「什么都没填」处理 ——
+    否则 body.get 会 AttributeError 变成 500，前端只能看到「服务器错误」。
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return {}
+    if not isinstance(body, dict):
+        return {}
+    return body
+
+
+def _filters_from_body(kind, body):
+    """
+    把请求体里的筛选字段翻译成 pv_store.get_slim 的关键字参数。
+
+    三种 kind 的筛选维度完全不同（图片按分类 id，资产按分类名 + 项目，词库按类型），
+    所以集中在这里翻译，避免每个 handler 各写一遍、字段名写错一个就静默失效。
+    """
+    k = str(kind or "").strip().lower()
+    if k in ("asset", "assets"):
+        return {
+            "category": str(body.get("category") or ""),
+            "project": str(body.get("project") or ""),
+        }
+    if k in ("text", "loras", "edits", "system-prompts", "system_prompts"):
+        return {"text_type": str(body.get("textType") or "loras")}
+    return {"category_id": str(body.get("categoryId") or "")}
+
+
 async def pv_categories(request):
     """
     返回 PromptVault 的分类路径列表，前端用来填「分类」下拉框。
@@ -353,25 +392,200 @@ async def pv_categories(request):
     刻意不发 Access-Control-Allow-Origin（防止任意网页读到本地数据），
     浏览器会拦掉跨源响应。所以只能由 ComfyUI 后端代转一次。
 
-    body: {"addr": "127.0.0.1:8766"}（留空 = 自动发现 8765-8775）
-    返回: {"ok": true, "categories": [{"path": "风格", "id": "...", "level": 1}]}
+    body: {"addr": "127.0.0.1:8766", "kind": "image"|"asset"}
+          （addr 留空 = 自动发现 8765-8775；kind 缺省 = image，向后兼容）
+    返回: {"ok": true, "categories": [{"path","id","level","parentPath"}]}
+          kind=asset 时额外有 "projects": ["角色", ..., "未分项目"]
           连不上时 {"ok": false, "error": "PromptVault 未运行（试过 8765-8775）..."}
     """
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    # 畸形请求（字符串 / 数组 / 数字）一律当「没填地址」处理
-    if not isinstance(body, dict):
-        body = {}
+    body = await _read_json_body(request)
     addr = body.get("addr", "")
+    kind = str(body.get("kind") or "image").strip().lower()
 
-    from .pv_nodes import list_category_paths
+    loop = asyncio.get_running_loop()
+
+    if kind in ("asset", "assets"):
+        from . import pv_client
+        # 资产图的分类/项目是从资产列表聚合出来的（桥接口没有单独的列表接口）
+        result = await loop.run_in_executor(None, pv_client.asset_facet_choices, addr)
+        return web.json_response(result)
+
+    # kind=image 的行为与改造前**完全一致**，只是 build_category_paths 多给了 parentPath
+    from .pv_client import list_category_paths
 
     # 网络请求最长 3 秒，绝不能放在事件循环里同步跑，否则 ComfyUI 整个假死
-    loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(None, list_category_paths, addr)
     return web.json_response(result)
+
+
+# ---------------------------------------------------------------- PromptVault v2
+#
+# 下面 4 个接口是面板（web/js/lib/*）用的数据入口。
+#
+# 铁律：**所有网络调用必须走 loop.run_in_executor**。
+# urllib 是同步阻塞的，直接 await 一个同步函数会让 aiohttp 的事件循环停住 ——
+# 表现是「点开面板的瞬间整个 ComfyUI 界面假死，进度条都不动」。
+# 这和现有 pv_categories 的写法保持一致。
+
+async def pv_list(request):
+    """
+    分页列表（面板的主数据源）。
+
+    body: {"addr":"", "kind":"image"|"asset"|"text",
+           "categoryId":"", "category":"", "project":"", "textType":"loras",
+           "q":"", "page":1, "pageSize":40, "refresh":false}
+    返回: {"ok":true, "total":9328, "page":1, "pageSize":40, "pages":234,
+           "addr":"http://127.0.0.1:8765", "tookMs":12, "items":[...]}
+
+    items 字段按 kind 精简（image: id/name/categoryId/width/height），
+    **不含 positive/negative/params 长文本** —— 那些由 pv_meta 按 id 单独取。
+    """
+    body = await _read_json_body(request)
+    addr = str(body.get("addr") or "")
+    kind = str(body.get("kind") or "image")
+    q = str(body.get("q") or "")
+    page_no = body.get("page", 1)
+    page_size = body.get("pageSize", 40)
+    refresh = bool(body.get("refresh"))
+    filters = _filters_from_body(kind, body)
+
+    def _work():
+        from . import pv_client, pv_store
+
+        started = time.perf_counter()
+        items, err = pv_store.get_slim(kind, addr, refresh=refresh, **filters)
+        if err:
+            return {"ok": False, "error": err}
+
+        haystack = None
+        if q.strip():
+            # 图片的 positive/negative/params 不在精简列表里，搜索要单独拿全文
+            haystack, hay_err = pv_store.search_haystack(kind, addr, **filters)
+            if hay_err:
+                return {"ok": False, "error": hay_err}
+
+        result = pv_store.page(items, q, page_no, page_size, haystack=haystack)
+        return {
+            "ok": True,
+            "total": result["total"],
+            "page": result["page"],
+            "pageSize": result["pageSize"],
+            "pages": result["pages"],
+            "addr": pv_client.resolve_base(addr) or "",
+            "tookMs": int((time.perf_counter() - started) * 1000),
+            "items": result["items"],
+        }
+
+    loop = asyncio.get_running_loop()
+    payload = await loop.run_in_executor(None, _work)
+    return web.json_response(payload)
+
+
+async def pv_meta(request):
+    """
+    按 id 批量取完整元数据（执行阶段用：工作流里存的是 id 清单）。
+
+    body: {"addr":"", "kind":"image"|"asset"|"text", "ids":["a1","a2"], "textType":"loras"}
+    返回: {"ok":true, "items":[完整元数据...], "missing":["已失效的 id"]}
+
+    missing 里的 id 是 PromptVault 里已经不存在的（用户删了图），
+    节点据此跳过并提示，**不是错误**。
+    """
+    body = await _read_json_body(request)
+    addr = str(body.get("addr") or "")
+    kind = str(body.get("kind") or "image")
+    ids = body.get("ids")
+    if not isinstance(ids, list):
+        ids = []
+    text_type = str(body.get("textType") or "loras")
+
+    def _work():
+        from . import pv_store
+
+        k = kind.strip().lower()
+        if k in ("asset", "assets"):
+            return pv_store.lookup_assets(addr, ids)
+        if k in ("text", "loras", "edits", "system-prompts", "system_prompts"):
+            return pv_store.lookup_text(addr, text_type, ids)
+        return pv_store.lookup_images(addr, ids)
+
+    loop = asyncio.get_running_loop()
+    items, missing, err = await loop.run_in_executor(None, _work)
+    if err:
+        return web.json_response({"ok": False, "error": err, "items": [], "missing": []})
+    return web.json_response({"ok": True, "items": items or [], "missing": missing or []})
+
+
+async def pv_thumb(request):
+    """
+    缩略图 / 原图代理（前端直接当 <img src> 用，所以是 GET）。
+
+    为什么必须走后端代理：PromptVault 只监听回环且刻意不发 CORS 头，
+    浏览器里 <img src="http://127.0.0.1:8765/..."> 会被拦掉。
+
+    query: id=<id>&kind=image|asset&size=thumb|full
+    返回: 二进制 + 透传的 Content-Type + Cache-Control: public, max-age=600
+          失败 404（前端 img.onerror 换占位块）/ 503（PromptVault 没开）
+
+    注意必须用 web.Response(body=...) 而不是 json_response —— 后者会把
+    bytes 当 JSON 序列化，图片直接变成一串数字。
+    """
+    item_id = request.query.get("id", "")
+    kind = request.query.get("kind", "image")
+    size = request.query.get("size", "thumb")
+    addr = request.query.get("addr", "")
+
+    def _work():
+        from . import pv_store
+        return pv_store.thumb(kind, addr, item_id, size)
+
+    loop = asyncio.get_running_loop()
+    data, mime, err = await loop.run_in_executor(None, _work)
+
+    if err or not data:
+        message = err or "图片不存在"
+        # PromptVault 没开是「服务不可用」，不是「这张图不存在」——
+        # 区分开，前端才能决定是提示用户开 PromptVault 还是画占位块
+        status = 503 if "未运行" in message else 404
+        return web.json_response({"ok": False, "error": message}, status=status)
+
+    return web.Response(
+        body=data,
+        content_type=mime or "application/octet-stream",
+        headers={"Cache-Control": "public, max-age=600"},
+    )
+
+
+async def pv_random(request):
+    """
+    从**当前筛选下的全部记录**里随机抽 N 个不重复 id。
+
+    body: {"addr":"", "kind":"image", "categoryId":"", "category":"", "project":"",
+           "textType":"loras", "q":"", "n":4, "exclude":["a1"]}
+    返回: {"ok":true, "ids":["x9","x3"], "total":17726}
+
+    为什么必须放后端：随机范围是「当前筛选下全部 N 张」，
+    而前端手里只有当前页 40 张 —— 在 40 张里抽，用户两次就发现「随机总是这几个」。
+    """
+    body = await _read_json_body(request)
+    addr = str(body.get("addr") or "")
+    kind = str(body.get("kind") or "image")
+    q = str(body.get("q") or "")
+    n = body.get("n", 1)
+    exclude = body.get("exclude")
+    if not isinstance(exclude, list):
+        exclude = []
+    filters = _filters_from_body(kind, body)
+
+    def _work():
+        from . import pv_store
+        return pv_store.sample_random(kind, addr, n=n, exclude=exclude, q=q, **filters)
+
+    loop = asyncio.get_running_loop()
+    ids, total, err = await loop.run_in_executor(None, _work)
+    if err:
+        return web.json_response({"ok": False, "error": err, "ids": [], "total": 0})
+    return web.json_response({"ok": True, "ids": ids or [], "total": total})
 
 
 # ---------------------------------------------------------------- 注册
@@ -401,6 +615,11 @@ def register_routes():
     _ROUTES.post("/dogking-tools/list_images")(list_images)
     _ROUTES.post("/dogking-tools/reset")(reset)
     _ROUTES.post("/dogking-tools/pv_categories")(pv_categories)
+    # v2 面板数据接口（4 条）。pv_thumb 是 GET —— 前端要能直接当 <img src> 用
+    _ROUTES.post("/dogking-tools/pv_list")(pv_list)
+    _ROUTES.post("/dogking-tools/pv_meta")(pv_meta)
+    _ROUTES.post("/dogking-tools/pv_random")(pv_random)
+    _ROUTES.get("/dogking-tools/pv_thumb")(pv_thumb)
     return True
 
 

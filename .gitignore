@@ -4,6 +4,9 @@ state.json.tmp
 # PromptVault 分类列表缓存（PromptVault 没开时兜底用）
 pv_categories_cache.json
 pv_categories_cache.json.tmp
+# PromptVault 资产图缓存（同上，含本地分类/项目名）
+pv_assets_cache.json
+pv_assets_cache.json.tmp
 
 # Python
 __pycache__/

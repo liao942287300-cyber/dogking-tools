@@ -1,0 +1,161 @@
+%% dogking-tools v2 · 时序图
+%% 对应 docs/ARCH-comfyui-nodes-v2.md §5
+
+%% ============================================================
+%% 5.1 节点 1：打开面板 → 选图 → 确定 → 执行 → 输出
+%% ============================================================
+sequenceDiagram
+    autonumber
+    actor U as 用户
+    participant N as 节点1 前端(pick.js)
+    participant P as PvPanel(内嵌)
+    participant SV as server.py
+    participant ST as pv_store
+    participant CL as pv_client
+    participant PV as PromptVault
+
+    U->>N: 拖出节点
+    N->>SV: POST pv_categories {addr:""}
+    SV->>CL: list_category_paths(addr)
+    CL->>PV: GET /api/categories
+    PV-->>CL: {ok, categories:[{id,name,level,parentId,order}]}
+    CL-->>SV: {ok, categories:[{path,id,level,parentPath}]}
+    SV-->>N: 同上
+    N->>N: 填 一级分类 options / 二级分类 options(叶子名)
+    N->>P: mount()（DOM widget 600px，随节点创建）
+
+    P->>SV: POST pv_list {kind:"image",categoryId:"",q:"",page:1,pageSize:40}
+    SV->>ST: get_slim("image", addr, category_id="")
+    alt 缓存未命中
+        ST->>CL: fetch_items(addr, "", "")
+        CL->>PV: GET /api/items?type=images （36MB / 0.37s）
+        PV-->>CL: {items:[17726]}
+        CL-->>ST: raw list
+        ST->>ST: 精简为 [{id,name,categoryId,w,h}]（1.5MB）缓存 120s
+    end
+    ST-->>SV: page(items, q, 1, 40) + total
+    SV-->>P: {ok,total:17726,page:1,pages:443,items:[40]}
+    loop 每张可见卡片
+        P->>SV: GET pv_thumb?id=..&kind=image&size=thumb
+        SV->>CL: fetch_image_bytes(addr, id, "thumb")
+        CL->>PV: GET /api/image?id=..&size=thumb
+        PV-->>CL: 35KB JPEG
+        CL-->>SV: bytes
+        SV-->>P: 200 image/jpeg + Cache-Control:max-age=600
+    end
+
+    U->>P: 点卡片（批量选：切换选中态 / Shift 连选）
+    P->>P: selected 顺序数组 + Set 同步
+    U->>P: 点「确定」
+    P->>N: onConfirm([{id,name},...])
+    N->>N: 写 已选清单 widget(JSON) + setDirtyCanvas
+    N->>N: 状态条 = 已选 12 张
+
+    U->>N: Queue Prompt
+    Note over N,PV: 以下在后端 Python 执行（同进程，不走 ComfyUI HTTP 接口）
+    N->>ST: lookup_images(addr, 全部 12 个 id)
+    alt _full_by_id 未命中（LRU 2000 / TTL 600s）
+        ST->>CL: fetch_items_by_ids(addr, 未命中的 id)
+        CL->>PV: GET /api/items?type=image&ids=a,b,c,...（4.3KB / 0.014s）
+        PV-->>CL: {ok, total:12, items:[12 条完整元数据], missing:[]}
+        CL-->>ST: ({id: item}, missing)
+        ST->>ST: 写入 _full_by_id（LRU + TTL 600s）
+    end
+    ST-->>N: ({id: {positive,negative,params,w,h}}, missing)
+    Note over N: missing 非空 → 跳过那几张，状态写「N 张已失效，已跳过」<br/>已连线的口必须给 _blank_image()，不能给 None
+    loop 12 张（线程池 4 并发）
+        N->>CL: fetch_image_bytes(addr, id, "full")
+        CL->>PV: GET /api/image?id=..&size=full
+        PV-->>CL: 原图字节
+        N->>N: tensor_from_bytes → [1,H,W,3] float32
+    end
+    N->>N: 以第 1 张宽高为基准 bilinear resize → torch.cat
+    N-->>U: IMAGE[12,H,W,3] / 正向\n\n拼接 / 负向 / 参数 / 序号0 / 总数12 / 状态
+    N->>N: notify_next(should_continue=false)（一次性模式）
+
+%% ============================================================
+%% 5.2 排队输出：连续两次执行
+%% ============================================================
+sequenceDiagram
+    autonumber
+    actor U as 用户
+    participant F as 前端(pick.js / dogking-tools.js)
+    participant EX as ComfyUI 执行器
+    participant N as DogkingPVPick.load()
+    participant ST as state.json
+    participant PV as PromptVault
+
+    U->>F: Queue Prompt（已选 12 张，排队输出，自动连续=on）
+    F->>EX: app.queuePrompt(0,1)
+    EX->>N: load(..., 已选清单=12个id, 自动连续=True, unique_id="12")
+    N->>ST: advance_pick_state("12", sel_hash, 12)
+    ST-->>N: rec{index:0} → 返回 (1, 12, more=True)，写回 index=1
+    N->>PV: 取第 1 张的元数据 + 原图
+    PV-->>N: bytes
+    N-->>EX: (IMAGE, 正向1, 负向1, 参数1, 1, 12, "第 1/12 张（排队输出 · …）")
+    N->>F: send_sync dogking-tools.next {should_continue:true, index:1}
+    EX-->>F: execution_success
+    F->>F: pendingContinue=true → setTimeout(80)
+    F->>EX: app.queuePrompt(0,1)     ← 第 2 次执行
+
+    EX->>N: load(同参数, unique_id="12")
+    N->>ST: advance_pick_state("12", sel_hash, 12)
+    ST-->>N: rec{index:1} → 返回 (2, 12, more=True)，写回 index=2
+    N->>PV: 取第 2 张（元数据命中 _full_by_id，0 HTTP；只拉原图）
+    PV-->>N: bytes
+    N-->>EX: (IMAGE, …, 2, 12, "第 2/12 张…")
+    N->>F: dogking-tools.next {should_continue:true, index:2}
+    Note over F,EX: ……重复到第 12 张……
+
+    EX->>N: load(第 12 次)
+    N->>ST: advance_pick_state → (12, 12, more=False)，写回 index=12
+    N->>F: dogking-tools.next {should_continue:false}
+    EX-->>F: execution_success
+    F->>F: pendingContinue=false → 不再排队（链停）
+
+    Note over U,ST: 用户下一次手动 Queue：index>=total → 归零，从第 1 张重新开始
+    U->>F: Queue Prompt
+    F->>EX: app.queuePrompt(0,1)
+    EX->>N: load(...)
+    N->>ST: advance_pick_state → idx 12>=12 归零 → (1, 12, True)
+
+%% ============================================================
+%% 5.3 节点 4：动态输出口同步
+%% ============================================================
+sequenceDiagram
+    autonumber
+    actor U as 用户
+    participant A as 节点4 前端(assets.js)
+    participant L as litegraph(LGraphNode)
+    participant G as graph.links
+    participant BE as DogkingPVAssets(后端)
+
+    U->>A: 打开面板勾 4 张 → 确定
+    A->>A: 已选清单 = [{id,name}×4]
+    A->>A: syncAssetOutputs(node)
+    Note over A: want = min(4,8) = 4，cur = 0
+    loop i=0..3
+        A->>L: addOutput("图"+(i+1), "IMAGE", {label:"图1 · 角色四视图-正面"})
+        L->>L: outputs.push + expandToFitContent()
+    end
+    A->>L: setSize([max(w,620), computeSize()[1]+28])
+
+    U->>A: 连线 图1→VAEEncode, 图2→ControlNet
+    A->>G: 建立 2 条 link
+
+    U->>A: 面板里取消勾选第 4 张 → 确定（现在 3 张）
+    A->>A: want = 3，cur = 4
+    A->>L: removeOutput(outputs.length-1)   ← 删尾部（第 4 个图片口）
+    L->>G: disconnectOutput(3) → 该 link 被移除（本来也没连）
+    Note over L: 3 个固定口(名称/总数/状态) 完全没动，连线零损失
+
+    U->>A: 把输出方式改成「批量输出」
+    A->>A: want = 1，cur = 3
+    A->>L: removeOutput(5) / removeOutput(4)
+    L->>G: 若图2 有连线 → 该连线被断开（用户可见，语义正确）
+
+    U->>A: Queue Prompt
+    A->>BE: prompt 里只有 outputs[0..4] 被引用
+    BE->>BE: sel 3 张 → tensors[0..0]（批量=1 个口）
+    BE-->>U: ("名称A,名称B,名称C", 3, "已输出 3 张（批量输出）", batch, None×7)
+    Note over BE: 未使用的 7 个 IMAGE 位返回 None；<br/>它们没有连线，ComfyUI 不会去取
