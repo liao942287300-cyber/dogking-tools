@@ -60,6 +60,8 @@ def _register_node_module(module_name, label):
 _register_node_module("pv_nodes", "PromptVault 数据源")
 # 资产图节点（v2：单张 / 多重）
 _register_node_module("pv_asset_nodes", "PromptVault 资产图")
+# 提示词元数据嵌入 PNG（出图后反向喂回 PromptVault）
+_register_node_module("pv_meta_nodes", "提示词元数据嵌入")
 
 WEB_DIRECTORY = "./web"
 

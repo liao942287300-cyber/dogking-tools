@@ -31,6 +31,9 @@ import "./nodes/vault.js";
 import "./nodes/asset.js";
 import "./nodes/assets.js";
 
+// 提示词元数据嵌入 PNG：只需要一条状态条，没有面板
+import "./nodes/meta-stamp.js";
+
 const comfyAPI = window.comfyAPI || {};
 const app = comfyAPI.app?.app;
 const api = comfyAPI.api?.api;

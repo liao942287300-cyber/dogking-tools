@@ -11,6 +11,9 @@ ComfyUI 提示词/图片批量加载节点。读 PromptVault（或任何工具�
 另外还有 4 个 **PromptVault 数据源节点**，不用导出文件，直接从 PromptVault 桌面应用实时拉
 提示词 / 图片 / 词库（见下方「节点：PromptVault 数据源」）。
 
+以及 1 个 **写回节点** —— 把提示词和生成参数（模型 / LoRA / 采样）嵌进 PNG 元信息，
+出图后拖回 PromptVault 就能自动带词带参数（见下方「节点：提示词嵌入 PNG 元数据」）。
+
 ---
 
 ## 安装
@@ -403,7 +406,6 @@ PromptVault 的桥接口没有「资产分类列表」这种接口，只能拉�
 状态条会写明实际结果：`已输出 1 张（图片 (28)） · 短边 1024 → 1820×1024`。
 
 ### 常见问题
-
 **Q：打开工作流时面板为什么是收起的？**
 A：刻意如此。打开工作流时用户只有两种动作 —— 直接跑（清单在隐藏 widget 里，收起不影响），
 或者改选择（必然要点开面板）。收起正好省掉一次无用加载，也不会一次拉几十张缩略图。
@@ -428,9 +430,114 @@ A：v2 把旧的「提示词 / 图片 / 图片+提示词 / 词库」4 个节点*
 
 ---
 
+## 节点：提示词嵌入 PNG 元数据（dogking-tools）
+
+分类：`dogking-tools`
+
+**把提示词写进 PNG 的元信息里，再导回 PromptVault 就能自动带词。**
+出图 → 嵌入 → 拖进 PromptVault，正向 / 负向两栏自动填好，不用手抄。
+
+### 为什么它自己存文件
+
+ComfyUI 节点之间传的是**纯张量**，不带任何附带信息；PNG 的文本块只在**写文件那一刻**
+产生。提示词只要停在某个节点的 widget 里，下游接哪个保存节点都不会把它写进图里 ——
+所以这个节点**自己往 `ComfyUI/output/` 写一份带元数据的 PNG**，同时把图片原样透传。
+
+> ⚠️ 它**替代**保存步骤。后面再接 `保存图像`（SaveImage）会多出一份没有提示词的拷贝。
+
+### 输入
+
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| **图片** | IMAGE 口 | 要写元数据的图；原样透传，不改尺寸不改像素 |
+| **正向提示词** | STRING 口（只接线，**必接**） | 接上游的字符串输出，写进 `parameters` 块 |
+| **负向提示词** | STRING 口（只接线，**可选**） | 接上游的字符串输出，写成 `Negative prompt:` 行；**不接就不写这一行**，不会报错 |
+| **文件名前缀** | 字符串 | 默认 `PromptVault`，自动补 `_00001_` 序号；支持 `子目录/名字` |
+
+两个提示词口是 **forceInput**：节点上只有插口，没有文本框。词都在上游节点里
+（PromptVault 节点的「提示词」输出、`PrimitiveString`、任意字符串节点）；
+再摆两个编辑框只会让人以为手填的值也会被写进去。
+
+### 输出
+
+| 输出口 | 类型 | 说明 |
+| --- | --- | --- |
+| **图片** | IMAGE | 原样透传，给下游预览 / 其他处理 |
+
+执行完**节点上会直接显示刚存的那张图**（和「保存图像」一样的预览框，批量时显示第一张），
+标题栏右侧还有个蓝色小标签写着文件名（如 `PromptVault_00001_.png`）；完整信息
+（正向多少字、负向多少字、失败原因）在 ComfyUI 控制台里。
+
+### 写进去的是什么
+
+只写 **一个** 文本块 —— `parameters`，内容按 A1111 规范：
+
+```
+银白发猫娘, 蓝白女仆装, 金铃铛蝴蝶结
+Negative prompt: lowres, bad anatomy, extra limbs
+Steps: 28, Sampler: dpmpp_2m, Schedule: karras, CFG scale: 6.5, Seed: 123456789, Size: 832x1216, Model: dreamshaper_8.safetensors, Lora_1: detail-tweaker.safetensors:0.8, VAE: vae-ft-mse.safetensors, Clip skip: 2
+```
+
+### 生成参数是自动抓的
+
+不用多接一排口。节点读 ComfyUI 的 `hidden: {"prompt": "PROMPT"}`（本次执行的
+API prompt 全图），按字段名扫一遍：
+
+| 字段 | 从哪来 |
+| --- | --- |
+| 模型 | `ckpt_name` / `unet_name`（Flux 走 UNETLoader）/ `model_name` |
+| LoRA | `lora_name` + `strength_model`，多个就 `Lora_1` `Lora_2`… |
+| VAE | `vae_name` |
+| 采样 | `steps` / `cfg` / `sampler_name` / `scheduler` / `seed`（或 `noise_seed`）/ `denoise` |
+| Clip skip | `stop_at_clip_layer` 取绝对值（A1111 记的是层数，ComfyUI 存的是负偏移） |
+| 尺寸 | **实际存下来的那张图**，不是 EmptyLatent 的设定值 |
+
+识别只看字段名和 class_type 关键词，不绑死节点类 —— `KSampler`、`KSamplerAdvanced`、
+`SamplerCustomAdvanced` + `KSamplerSelect` + `RandomNoise` + `ManualSigmas` 这套组合
+都能收。多个采样器（hires fix）只取节点 id 最小的那个主采样；链接进来的值
+（比如 seed 接了别的节点）会跳过、不瞎猜。
+
+几点要说清：
+
+- **步数有兜底**：新版 ComfyUI 的主力是 `SamplerCustomAdvanced` + `ManualSigmas`，
+  **整张图里没有 `steps` 字段**，步数藏在 sigmas 串里 —— 10 个 sigma 值 = 9 步，
+  节点会数出来。只认 `steps` 的话这类工作流（Qwen / Flux 基本都是）一个参数都写不出。
+- **参数行必须以 `Steps:` 开头**。PromptVault 靠这个标记认定「从这儿起是参数」，
+  没有它后面的内容会被当成负向词的延续。真拿不到步数时，这一行改写成**独立文本块**
+  （key = `params`），由 PromptVault 的兜底分支收进「参数」栏，不会污染负向词。
+  参数栏里会显示成 `params: Size: 832x1216, Lora_1: ...`，多一个前缀是正常的。
+- 只有 `Size` 没有别的字段时**不写参数** —— 纯裁切 / 放大的图没有采样信息，
+  写一行 `Size: 512x512` 只是噪音。这种情况标题栏 badge 会显示「无参数」。
+- 只有 `denoise ≠ 1` 时才写 Denoise，默认值写了只是噪音。
+- **已知限制**：条件分支（`easy ifElse` 这类）里挂着的多个 LoRA 会被**全部列出** ——
+  API prompt 只记录图的结构，不记录实际走了哪条分支，所以节点无从判断。
+
+PromptVault 的 `js/png-meta.js` 按这个顺序识别：`parameters` → `prompt`/`workflow`
+（ComfyUI JSON）→ `comment`（NovelAI）→ 显式负向键 → 其余兜底。写标准 A1111
+格式能让它**精确**拆出正向和负向，不依赖「靠 worst quality 这类词猜哪段是负向」
+的启发式。
+
+反之**故意不写** `positive` / `workflow` 这些块：`positive` 会落到兜底分支被拼进
+「参数」栏，`workflow`（ComfyUI JSON）会把整段 JSON 塞进「参数」栏 —— 都是脏数据。
+
+中文提示词用 **iTXt**（PNG 里唯一声明 UTF-8 的文本块），不是 `tEXt`（latin-1，中文会炸）。
+注意 iTXt 的**值**是 UTF-8，**key 仍是 Latin-1** —— 所以块名只能是 ASCII 的
+`parameters` / `params`，写成中文会让 Pillow 抛 `UnicodeEncodeError`、整张图存不下来
+（节点内部对这种情况有 ASCII 兜底，不会真的失败）。
+
+### 注意
+
+- 文件保存在 `ComfyUI/output/`，`文件名前缀` 支持 `%date%` / `%width%` 这类占位符
+  （走 ComfyUI 自己的 `get_save_image_path`，编号规则和 `保存图像` 一致）。
+- 正向、负向都为空时仍然存图，但**不写文本块**，标题栏标签会带「空词」，提示词管理里
+  这张图会落到「无提示词」。
+- 每次执行都会新存一个文件（不命中缓存），连跑 10 次就是 10 个文件。
+
+---
+
 ## 跑测试
 
-### Python 测试（91 条）
+### Python 测试（123 条）
 
 ```bash
 # 全部测试（推荐）
@@ -440,6 +547,7 @@ pytest tests/
 python tests/test_pv_nodes.py        # 36 条
 python tests/test_pv_store.py        # 32 条
 python tests/test_pv_asset_nodes.py  # 22 条
+python tests/test_pv_meta.py         # 25 条
 python tests/test_pv_client.py       # 53 条断言（脚本式）
 ```
 
@@ -448,6 +556,7 @@ python tests/test_pv_client.py       # 53 条断言（脚本式）
 | `test_pv_nodes.py` | 36 | 清单解析 / 指纹 / 尺寸统一 / 排队游标 / 节点 1、2 的每个出口 |
 | `test_pv_store.py` | 32 | 缓存 TTL 与淘汰 / 分页边界 / 搜索 / 随机 / 缩略图 LRU |
 | `test_pv_asset_nodes.py` | 22 | 节点 3、4 的**每个 return 点**（按出口组织，不按功能点） |
+| `test_pv_meta.py` | 25 | 参数扫描（含「全图没有 steps」的 sigmas 工作流）/ 参数行不得污染负向词 / iTXt 中文往返 |
 | `test_pv_client.py` | 1（包装） | HTTP 层的 `includeChildren` 等不变量（53 条 `check()` 在 import 时跑完，末尾用一条包装交给 pytest） |
 
 > ⚠️ **`tests/conftest.py` 不是装饰品，别删。**

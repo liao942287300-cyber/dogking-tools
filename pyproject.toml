@@ -1,7 +1,7 @@
 [project]
 name = "dogking-tools"
-version = "1.1.0"
-description = "Batch prompt loader for txt/csv files. Three modes (all lines / range / single index), auto-queues the next run, and resumes interrupted batches."
+version = "1.2.0"
+description = "Batch prompt loader for txt/csv files plus PromptVault data-source nodes and a PNG metadata stamp node that embeds prompts and generation params into saved images."
 license = { file = "LICENSE" }
 requires-python = ">=3.9"
 dependencies = []
