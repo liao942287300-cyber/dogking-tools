@@ -21,7 +21,18 @@ ComfyUI 提示词/图片批量加载节点。读 PromptVault（或任何工具�
 ComfyUI/custom_nodes/dogking-tools/
 ```
 
-没有第三方依赖，不需要 `pip install`。
+两种装法：
+
+```bash
+# ① git clone（后续 git pull 就能更新）
+cd ComfyUI/custom_nodes
+git clone https://github.com/liao942287300-cyber/dogking-tools.git
+```
+
+② 从 [Releases](https://github.com/liao942287300-cyber/dogking-tools/releases/latest) 下 `dogking-tools-x.x.x.zip`，
+解压到 `custom_nodes/` 下，**目录名保持 `dogking-tools`**（改成别的名字也行，但插件更新时容易搞混）。
+
+没有第三方依赖，不需要 `pip install`。装完要**重启 ComfyUI**，只刷新网页不够 —— Python 节点要重新导入。
 
 「选择文件」按钮在 Windows 上用 `ctypes` 直接调系统 `comdlg32.GetOpenFileNameW`，
 **不依赖 tkinter** —— ComfyUI 的 `python_embeded` 是精简版，本身不带 tkinter。
