@@ -182,12 +182,22 @@ def _add_audio_stream(container, data, rate, channels):
     return stream
 
 
-def _write_audio(container, stream, data, rate):
-    """按 1024 样本一块喂 AAC 编码器，最后一块补零；末尾必须 flush。"""
+def _write_audio(container, stream, data, rate, max_seconds=None):
+    """
+    按 1024 样本一块喂 AAC 编码器，最后一块补零；末尾必须 flush。
+
+    `max_seconds` 给了就按它截断：成片长度由帧数决定（17N+5 取整后总比音频差几帧），
+    不截的话末尾会出现「画面停住、声音还在走」—— 反过来截短更自然。
+    """
     import av
 
     chunk = 1024
     total = int(data.shape[-1])
+    if max_seconds:
+        limit = int(float(max_seconds) * int(rate))
+        if 0 < limit < total:
+            data = data[:, :limit]
+            total = limit
     pts = 0
     for start in range(0, total, chunk):
         block = data[:, start : start + chunk]
@@ -264,7 +274,10 @@ def concat_segments(files, out_path, fps, audio=None):
             container.mux(packet)
 
         if audio_stream is not None:
-            _write_audio(container, audio_stream, audio_data, audio_rate)
+            # 按成片长度截断：视频比音频短时（17N+5 取整、或最后一段少几帧），
+            # 不截的话末尾会拖一段「画面停住、声音还在走」。
+            _write_audio(container, audio_stream, audio_data, audio_rate,
+                         max_seconds=written / float(fps))
     finally:
         container.close()
     return written

@@ -210,6 +210,34 @@ def test_audio_track_is_muxed():
         assert int(container.streams.audio[0].codec_context.sample_rate) == rate
 
 
+def test_audio_is_trimmed_to_video_length():
+    """
+    音频比成片长时按成片截断。
+
+    成片长度由帧数决定（17N+5 取整后总比音频差几帧），不截的话末尾会拖一段
+    「画面停住、声音还在走」—— 比截短难看得多。
+    """
+    _isolate()
+    node = _node()
+    rate = 8000
+    # 视频 4+4 帧 @8fps = 1 秒；音频给 3 秒
+    audio = {"waveform": torch.zeros(1, 1, rate * 3), "sample_rate": rate}
+
+    node.concat(图像=_frames(4), 段序号=1, 段数=2, fps=FPS, 任务名="截断")
+    out = node.concat(图像=_frames(4), 段序号=2, 段数=2, fps=FPS, 任务名="截断",
+                      音频=audio)
+    path = out["result"][0]
+
+    import av
+
+    with av.open(path) as container:
+        stream = container.streams.audio[0]
+        assert stream.duration, "音轨时长读不到"
+        seconds = float(stream.duration * stream.time_base)
+        # AAC 有帧对齐 padding，1 秒通常落在 1.0~1.1 之间
+        assert 0.9 <= seconds <= 1.2, "音轨没按成片长度截断，实际 %.2fs" % seconds
+
+
 if __name__ == "__main__":
     import inspect
 

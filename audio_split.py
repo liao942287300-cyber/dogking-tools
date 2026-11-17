@@ -324,6 +324,40 @@ def audio_duration(audio):
         return 0.0
 
 
+def parse_range(raw):
+    """
+    从分段 JSON 里取「选区」——波形上最外侧那两条边界之间的一段。
+
+    选区决定的是「整条音频要哪一截」，和怎么分段无关。单独解析它，是因为下游
+    「分段视频合并」最后要拿**整条**音轨压进成片，而「音频」口只吐当前段。
+
+    @returns {tuple|None} `(start, end)` 秒；老工作流没有 range 字段时返回 None
+    """
+    if isinstance(raw, dict):
+        data = raw
+    elif isinstance(raw, (list, tuple)):
+        return None
+    else:
+        try:
+            data = json.loads(str(raw or "").strip() or "{}")
+        except Exception:
+            return None
+
+    if not isinstance(data, dict):
+        return None
+    rng = data.get("range")
+    if not isinstance(rng, dict):
+        return None
+    try:
+        start = float(rng.get("start"))
+        end = float(rng.get("end"))
+    except (TypeError, ValueError):
+        return None
+    if not (end > start):
+        return None
+    return max(0.0, start), end
+
+
 def slice_audio(audio, start, end):
     """
     按秒切一段出来。
@@ -432,8 +466,8 @@ class DogkingAudioSplit:
     # 输出里**只有一个**「提示词」口：段内有独立词就出独立词，没有就出全局词。
     # 不再单独开「全局提示词」口 —— 两个口摆在一起，用户不知道接哪个，
     # 接错了还会把全局词无脑顶掉段内词，等于把「覆盖」功能绕过去了。
-    RETURN_TYPES = ("AUDIO", "STRING", "INT", "INT", "FLOAT")
-    RETURN_NAMES = ("音频", "提示词", "段序号", "段数", "本段时长")
+    RETURN_TYPES = ("AUDIO", "STRING", "INT", "INT", "FLOAT", "AUDIO")
+    RETURN_NAMES = ("音频", "提示词", "段序号", "段数", "本段时长", "选区音频")
     FUNCTION = "split"
     CATEGORY = "dogking-tools"
     DESCRIPTION = (
@@ -458,6 +492,19 @@ class DogkingAudioSplit:
 
         audio = self._resolve_audio(音频, 文件路径)
         total = len(segments)
+
+        # 「选区音频」= 整条选区（裁掉头尾之后），不是某一段。
+        # 下游「分段视频合并」最后要拿整条音轨压进成片，而「音频」口只给当前段 ——
+        # 用户在面板上传的音频 + 框的选区都在这个节点里，外面拿不到，所以从这里吐一份。
+        # 老工作流没有 range 字段时直接给整条（和以前的行为一致）。
+        sel_range = parse_range(分段数据)
+        if sel_range:
+            try:
+                选区音频 = slice_audio(audio, sel_range[0], sel_range[1])
+            except ValueError:
+                选区音频 = audio      # 选区越界（音频比记录短）就退回整条，别让节点红
+        else:
+            选区音频 = audio
 
         if 输出模式 == MODE_SINGLE:
             index = max(1, min(int(当前段), total)) - 1
@@ -501,7 +548,7 @@ class DogkingAudioSplit:
                 "dogking_badge": ["%d/%d · %.1fs" % (index + 1, total, duration)],
                 "dogking_index": [index + 1],
             },
-            "result": (piece, prompt, index + 1, out_total, duration),
+            "result": (piece, prompt, index + 1, out_total, duration, 选区音频),
         }
 
     @staticmethod

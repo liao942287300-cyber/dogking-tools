@@ -243,6 +243,46 @@ def test_node_out_total_reports_run_size():
     assert _run(node, segs, mode="顺序", cur=1)["result"][3] == 3
 
 
+def test_parse_range_reads_selection():
+    data = json.dumps({"range": {"start": 2, "end": 6}, "segments": []}, ensure_ascii=False)
+    assert _av.parse_range(data) == (2.0, 6.0)
+    # 老工作流没有 range / 选区被写反 / 空串 → None，调用方退回「整条音频」
+    assert _av.parse_range(_segments((0, 1, ""))) is None
+    assert _av.parse_range(json.dumps({"range": {"start": 5, "end": 3}})) is None
+    assert _av.parse_range("") is None
+    assert _av.parse_range(None) is None
+
+
+def test_selected_audio_output_is_whole_range():
+    """
+    「选区音频」必须是**整条选区**（2–6 秒 = 4 秒），不能是当前那一段（2 秒）。
+
+    合并节点最后靠这一口压音轨 —— 要是给成当前段，成片就只有第一截有声音。
+    """
+    node = _av.DogkingAudioSplit()
+    data = json.dumps({
+        "range": {"start": 2, "end": 6},
+        "segments": [
+            {"start": 2, "end": 4, "prompt": ""},
+            {"start": 4, "end": 6, "prompt": ""},
+        ],
+    }, ensure_ascii=False)
+    out = _run(node, data, mode="单段", cur=1, audio=_audio(10.0, 8000), uid="sel")
+
+    assert out["result"][0]["waveform"].shape[-1] == 2 * 8000    # 当前段 2 秒
+    selected = out["result"][5]
+    assert selected["waveform"].shape[-1] == 4 * 8000            # 选区 4 秒
+    assert int(selected["sample_rate"]) == 8000
+
+
+def test_selected_audio_falls_back_to_whole_file():
+    """没有选区（老工作流）时「选区音频」= 整条音频，行为和以前一致。"""
+    node = _av.DogkingAudioSplit()
+    out = _run(node, _segments((0, 1, "")), mode="单段", cur=1,
+               audio=_audio(3.0, 8000), uid="sel2")
+    assert out["result"][5]["waveform"].shape[-1] == 3 * 8000
+
+
 def test_node_cut_change_resets_cursor():
     node = _av.DogkingAudioSplit()
     segs_a = _segments((0, 1, ""), (1, 2, ""), (2, 3, ""))
@@ -289,7 +329,7 @@ def test_output_ports_have_single_prompt_port():
     cls = _av.DogkingAudioSplit
     assert "全局提示词" not in cls.RETURN_NAMES
     assert cls.RETURN_NAMES.count("提示词") == 1
-    assert len(cls.RETURN_TYPES) == len(cls.RETURN_NAMES) == 5
+    assert len(cls.RETURN_TYPES) == len(cls.RETURN_NAMES) == 6
 
     segs = _segments((0, 1, "独立词"), (1, 2, ""))
     node = cls()
