@@ -38,7 +38,7 @@ const api = comfyAPI.api?.api;
 
 const NODE_NAME = "DogkingAudioSplit";
 /** 面板高度。给波形 150 + 工具栏 + 段清单滚动区留够空间 */
-const PANEL_HEIGHT = 430;
+const PANEL_HEIGHT = 452;   // 比面板内容多留一点：加了播放进度条那行
 /** 顺序模式执行完，后端发这个事件让前端自动排下一段 */
 const EVENT_NEXT = "dogking-tools.audio.next";
 /** 最小段长（秒）。比这更短的段切出来是噪音，拖到头就当合并 */
@@ -107,6 +107,62 @@ function injectStyles() {
   overflow: hidden;
 }
 .dk-as-wavewrap canvas { display: block; width: 100%; height: 100%; }
+/* 播放进度条：轨道 + 填充 + 切点刻度，整条可点可拖（定位播放位置） */
+.dk-as-prog {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 2px;
+}
+.dk-as-track {
+  position: relative;
+  flex: 1 1 auto;
+  height: 10px;
+  border-radius: 5px;
+  background: rgba(120, 150, 210, 0.18);
+  box-shadow: inset 0 0 0 1px rgba(120, 150, 210, 0.22);
+  cursor: pointer;
+  overflow: hidden;
+}
+.dk-as-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  height: 100%;
+  width: 0;
+  border-radius: 5px;
+  background: linear-gradient(90deg, #2f9c76, #3fd39a);
+  box-shadow: 0 0 6px rgba(63, 211, 154, 0.5);
+  transition: width 60ms linear;
+}
+.dk-as-ticks { position: absolute; inset: 0; pointer-events: none; }
+.dk-as-knob {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 12px;
+  height: 12px;
+  margin: -6px 0 0 -6px;
+  border-radius: 50%;
+  background: #eaf5ff;
+  box-shadow: 0 0 0 2px rgba(63, 211, 154, 0.9), 0 1px 4px rgba(0, 0, 0, 0.55);
+  pointer-events: none;
+}
+.dk-as-tick {
+  position: absolute;
+  top: 0;
+  width: 1px;
+  height: 100%;
+  background: rgba(226, 236, 252, 0.45);
+}
+.dk-as-proglbl {
+  flex: 0 0 auto;
+  min-width: 104px;
+  text-align: right;
+  color: #9fb0c8;
+  font-size: 11px;
+}
 .dk-as-sec {
   flex: 0 0 auto;
   width: 56px;
@@ -158,6 +214,14 @@ function injectStyles() {
   cursor: pointer;
 }
 .dk-as-time:hover { color: #cfe0ff; text-decoration: underline; }
+.dk-as-dur {
+  flex: 0 0 auto;
+  min-width: 40px;
+  text-align: right;
+  color: #7f8ea8;
+  font-size: 11px;
+}
+.dk-as-row--playing .dk-as-dur { color: #a9f3d4; }
 .dk-as-prompt {
   flex: 1 1 auto;
   min-width: 40px;
@@ -281,6 +345,18 @@ class AudioSplitPanel {
     this.canvas = document.createElement("canvas");
     wrap.appendChild(this.canvas);
 
+    /* 播放进度条：波形下面一条细轨道，填充到当前播放位置，可点击/拖动定位 */
+    const prog = el("div", "dk-as-prog");
+    this.progTrack = el("div", "dk-as-track");
+    this.progTicks = el("div", "dk-as-ticks");
+    this.progFill = el("div", "dk-as-fill");
+    this.progKnob = el("div", "dk-as-knob");
+    this.progTrack.append(this.progTicks, this.progFill, this.progKnob);
+    this.progLabel = el("span", "dk-as-proglbl", "00:00.00 / 00:00.00");
+    this.progLabel.title = "当前位置 / 音频总长";
+    prog.append(this.progTrack, this.progLabel);
+    this.bindProgress();
+
     /* 工具行 */
     const tools = el("div", "dk-as-tools");
     this.btnCut = el("button", "", "加切点");
@@ -299,7 +375,7 @@ class AudioSplitPanel {
     /* 段清单 */
     this.listEl = el("div", "dk-as-list");
 
-    this.el.append(bar, wrap, tools, this.listEl);
+    this.el.append(bar, wrap, prog, tools, this.listEl);
     this.mount.appendChild(this.el);
 
     /* 事件（全部隔离，别让画布跟着动） */
@@ -494,6 +570,7 @@ class AudioSplitPanel {
     }
 
     this.cursor = t;
+    this.paintTicks();
     // 拖动过程中**只重画画布**：段清单里有输入框，每帧重建 DOM 会打断输入、
     // 段数多时也卡。清单等 pointerup 时再重建（见 bindCanvas 的 endDrag）。
     this.draw();
@@ -695,6 +772,9 @@ class AudioSplitPanel {
         this.commit();
       }
       this.renderList();
+      this.paintTicks();
+      // 换音频后播放位置归零；同一音频重载则保留原位置（够不到就夹回总长）
+      this.updateProgress(Math.min(this.audioEl.currentTime || 0, this.duration));
       this.draw();
     } catch (err) {
       const aborted = err?.name === "AbortError";
@@ -719,12 +799,102 @@ class AudioSplitPanel {
   bindAudio() {
     // 试听到段尾自动停 —— 用户靠它确认切点切得对不对
     this.audioEl.addEventListener("timeupdate", () => {
+      this.updateProgress();
       if (this.playing < 0) return;
       const seg = this.segments[this.playing];
       if (!seg) return;
       if (this.audioEl.currentTime >= seg.end) this.stopPlay();
     });
     this.audioEl.addEventListener("ended", () => this.stopPlay());
+  }
+
+  /* ---------------- 播放进度条 ---------------- */
+
+  bindProgress() {
+    const track = this.progTrack;
+    const at = (e) => {
+      const rect = track.getBoundingClientRect();
+      const x = Math.min(Math.max(0, e.clientX - rect.left), rect.width);
+      return (x / Math.max(1, rect.width)) * (this.duration || 0);
+    };
+
+    let dragging = false;
+    track.addEventListener("pointerdown", (e) => {
+      e.stopPropagation();
+      if (!this.duration) return;
+      dragging = true;
+      track.setPointerCapture?.(e.pointerId);
+      this.seekTo(at(e));
+      e.preventDefault();
+    });
+    track.addEventListener("pointermove", (e) => {
+      if (!dragging) return;
+      e.stopPropagation();
+      this.seekTo(at(e));
+    });
+    const stopSeek = (e) => {
+      if (!dragging) return;
+      dragging = false;
+      try {
+        track.releasePointerCapture?.(e.pointerId);
+      } catch (err) {
+        /* 已释放 */
+      }
+    };
+    track.addEventListener("pointerup", stopSeek);
+    track.addEventListener("pointercancel", stopSeek);
+  }
+
+  /** 跳到某个时间；正在放就接着放。顺便把光标挪过去，「加切点」就跟着这里 */
+  seekTo(time) {
+    const t = Math.min(Math.max(0, Number(time) || 0), this.duration || 0);
+    this.cursor = t;
+    try {
+      this.audioEl.currentTime = t;
+    } catch (err) {
+      /* 音频还没加载好，忽略；fill 仍然按 t 画 */
+    }
+
+    // 跳到哪一段，就把选中/试听状态切到那一段 —— 否则进度条在响第 5 段，
+    // 高亮还停在第 2 段，看着就是错的
+    const idx = this.segments.findIndex((s) => t >= s.start && t < s.end);
+    if (idx >= 0 && (idx !== this.active || (this.playing >= 0 && idx !== this.playing))) {
+      this.active = idx;
+      if (this.playing >= 0) this.playing = idx;
+      this.writeWidget("当前段", this.active + 1);
+      this.updatePlayButton();
+      this.paintPlaying();
+      this.draw();
+    }
+
+    this.updateProgress(t);
+    this.draw();
+  }
+
+  /** 刷新进度条填充与「当前 / 总长」文字 */
+  updateProgress(pos) {
+    if (!this.progFill || !this.progLabel) return;
+    const dur = this.duration || 0;
+    const cur = Math.min(Math.max(0, pos === undefined || pos === null ? this.audioEl.currentTime || 0 : pos), dur);
+    const pct = dur > 0 ? (cur / dur) * 100 : 0;
+    this.progFill.style.width = `${pct.toFixed(2)}%`;
+    if (this.progKnob) this.progKnob.style.left = `${pct.toFixed(2)}%`;
+    this.progLabel.textContent = `${fmtTime(cur)} / ${fmtTime(dur)}`;
+  }
+
+  /** 进度条上的切点刻度：和波形上的切点一一对应（首尾不画，贴边看不出来） */
+  paintTicks() {
+    if (!this.progTicks) return;
+    this.progTicks.textContent = "";
+    const dur = this.duration || 0;
+    if (!dur) return;
+    this.boundaries().forEach((t, i) => {
+      if (i === 0 || t >= dur - 1e-6) return;
+      const tick = document.createElement("div");
+      tick.className = "dk-as-tick";
+      tick.style.left = `${(t / dur) * 100}%`;
+      this.progTicks.appendChild(tick);
+    });
   }
 
   /** 试听按钮的文案：直接写"第几段"，省得用户猜在放哪段 */
@@ -749,6 +919,7 @@ class AudioSplitPanel {
     this.stopPlayTicker();
     const tick = () => {
       if (this.playing < 0) return;
+      this.updateProgress();
       this.draw();
       this.playRaf = requestAnimationFrame(tick);
     };
@@ -785,6 +956,7 @@ class AudioSplitPanel {
     });
     this.updatePlayButton();
     this.paintPlaying();
+    this.updateProgress(seg.start);
     this.startPlayTicker();
     this.draw();
   }
@@ -799,6 +971,7 @@ class AudioSplitPanel {
     this.stopPlayTicker();
     this.updatePlayButton();
     this.paintPlaying();
+    this.updateProgress();
     this.draw();
   }
 
@@ -1008,6 +1181,7 @@ class AudioSplitPanel {
         ? "还没有分段：点「自动等分」，或双击波形自己切"
         : "选一个音频开始";
       this.listEl.appendChild(hint);
+      this.paintTicks();
       return;
     }
 
@@ -1039,6 +1213,13 @@ class AudioSplitPanel {
         this.togglePlay();
       });
 
+      // 段长单独一列：4 分半的音频上，光看起止时间是算不出「这段几秒」的
+      const durEl = document.createElement("span");
+      durEl.className = "dk-as-dur";
+      const secs = Math.max(0, seg.end - seg.start);
+      durEl.textContent = `${secs.toFixed(secs < 10 ? 2 : 1)}s`;
+      durEl.title = `这一段 ${secs.toFixed(2)} 秒`;
+
       const input = document.createElement("input");
       input.className = "dk-as-prompt";
       input.type = "text";
@@ -1056,17 +1237,19 @@ class AudioSplitPanel {
       del.title = "删除这一段（并入相邻段）";
       del.addEventListener("click", () => this.removeSegment(i));
 
-      row.append(idx, time, input, del);
+      row.append(idx, time, durEl, input, del);
       this.listEl.appendChild(row);
       this.rows.push({ row, idx, time });
     });
+    this.paintTicks();
   }
 
-  /** 只改试听高亮，不重建 DOM —— 重建会把用户正在输入的提示词冲掉 */
+  /** 只改选中/试听高亮，不重建 DOM —— 重建会把用户正在输入的提示词冲掉 */
   paintPlaying() {
     this.rows.forEach((ref, i) => {
       const isPlaying = i === this.playing;
       ref.row.classList.toggle("dk-as-row--playing", isPlaying);
+      ref.row.classList.toggle("dk-as-row--active", i === this.active);
       ref.idx.textContent = isPlaying ? "♪" : String(i + 1);
       ref.idx.title = isPlaying ? "正在试听这一段" : "";
     });
