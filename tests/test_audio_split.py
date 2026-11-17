@@ -97,6 +97,25 @@ def test_parse_accepts_bare_list():
     assert len(segs) == 1
 
 
+def test_parse_ignores_range_key():
+    """
+    前端现在会往「分段数据」里多写一个 range（选区/裁剪窗口）。
+
+    后端只按 segments 切音频 —— range 只是前端的框选状态，真正的裁剪已经体现在
+    每段的 start/end 上了。多出来这个 key 不能被当成坏数据。
+    """
+    raw = json.dumps({
+        "range": {"start": 6.0, "end": 20.0},
+        "segments": [
+            {"start": 6.0, "end": 9.0, "prompt": "甲"},
+            {"start": 9.0, "end": 12.0, "prompt": ""},
+        ],
+    }, ensure_ascii=False)
+    segs = _av.parse_segments(raw)
+    assert [s["start"] for s in segs] == [6.0, 9.0]
+    assert segs[0]["prompt"] == "甲"
+
+
 # ---------------------------------------------------------------- ② 指纹 / 提示词
 
 def test_signature_changes_with_cut_points():
