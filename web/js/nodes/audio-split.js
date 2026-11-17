@@ -44,11 +44,9 @@ const EVENT_NEXT = "dogking-tools.audio.next";
 /** 最小段长（秒）。比这更短的段切出来是噪音，拖到头就当合并 */
 const MIN_GAP = 0.06;
 /** 边界判定的像素容差：离切点这么近就认为是「想拖这条线」 */
-const HIT_PX = 7;
+const HIT_PX = 9;
 /** 波形高度 */
 const WAVE_H = 150;
-/** 时间刻度上方的留白 */
-const WAVE_PAD = 4;
 
 /* ==================================================================== 样式 */
 
@@ -141,6 +139,13 @@ function injectStyles() {
   border-color: rgba(120, 170, 255, 0.55);
   background: rgba(90, 130, 220, 0.14);
 }
+/* 试听中的那一段：绿色，编号位置显示 ♪ —— 和波形上的绿块是同一个色 */
+.dk-as-row--playing {
+  border-color: rgba(63, 211, 154, 0.7);
+  background: rgba(35, 160, 115, 0.16);
+}
+.dk-as-row--playing .dk-as-idx { color: #3fd39a; font-weight: 700; }
+.dk-as-row--playing .dk-as-time { color: #a9f3d4; }
 .dk-as-idx {
   flex: 0 0 auto;
   width: 20px;
@@ -239,7 +244,11 @@ class AudioSplitPanel {
     this.duration = 0;
     this.peaks = [];
     this.active = 0;
-    this.drag = null;       // {edge: bool, index: number, left: number}
+    this.drag = null;       // {b: 边界序号} —— 拖的是"第几条切点线"，0 = 最左，n = 最右
+    this.hoverB = -1;       // 鼠标悬停/靠近的边界序号，-1 = 没有
+    this.cursor = -1;       // 波形上点的位置（秒），「加切点」就在这儿切；-1 = 没点过
+    this.rows = [];         // 段清单的行引用（试听高亮时只改 class，不重建 DOM）
+    this.playRaf = 0;
     this.audioEl = new Audio();
     this.playing = -1;      // 正在试听第几段（-1 = 没在放）
 
@@ -275,7 +284,9 @@ class AudioSplitPanel {
     /* 工具行 */
     const tools = el("div", "dk-as-tools");
     this.btnCut = el("button", "", "加切点");
+    this.btnCut.title = "在波形上点一下定位（虚线），再点这里就在虚线处切；没定位就切选中段的正中";
     this.btnEven = el("button", "", "自动等分");
+    this.btnEven.title = "按右边填的秒数从 0 开始等分，之后可以拖切点微调";
     this.secInput = el("input", "dk-as-sec");
     this.secInput.type = "number";
     this.secInput.min = "0.5";
@@ -331,99 +342,158 @@ class AudioSplitPanel {
 
   /* ---------------- 波形交互 ---------------- */
 
+  /**
+   * 所有切点（共 `段数 + 1` 条）：第 0 条是最左端，最后一条是最右端。
+   *
+   * 中间任意一条都是**相邻两段共用的那条线** —— 拖动它，左边段的 end 和右边段的
+   * start 一起动。之前只改一侧，于是拖一下就撕出一个空洞（或压成 0.06 秒的碎段），
+   * 这就是「线条不能自由拉动」的真正原因。
+   */
+  boundaries() {
+    const segs = this.segments;
+    if (!segs.length) return [];
+    const out = [segs[0].start];
+    for (let i = 1; i < segs.length; i += 1) out.push(segs[i].start);
+    out.push(segs[segs.length - 1].end);
+    return out;
+  }
+
+  /** 第 b 条边界现在在几秒 */
+  boundaryTime(b) {
+    return this.boundaries()[b];
+  }
+
   bindCanvas() {
     const cv = this.canvas;
 
+    const xOf = (e) => {
+      const rect = cv.getBoundingClientRect();
+      return Math.min(Math.max(0, e.clientX - rect.left), rect.width);
+    };
     const timeAt = (e) => {
       const rect = cv.getBoundingClientRect();
-      const x = Math.min(Math.max(0, e.clientX - rect.left), rect.width);
-      return (x / Math.max(1, rect.width)) * (this.duration || 0);
+      return (xOf(e) / Math.max(1, rect.width)) * (this.duration || 0);
     };
 
-    /** 找离点击位置最近的切点（段边界）。返回 {index, side} */
+    /** 找离鼠标最近的切点线，命中半径 HIT_PX 像素 */
     const hitEdge = (e) => {
       const rect = cv.getBoundingClientRect();
-      const x = e.clientX - rect.left;
-      const t = (x / Math.max(1, rect.width)) * (this.duration || 0);
-      let best = null;
-      for (let i = 0; i < this.segments.length; i += 1) {
-        const seg = this.segments[i];
-        // 每段的左边界；最后一段额外检查右边界
-        const marks = [{ t: seg.start, index: i, side: "start" }];
-        if (i === this.segments.length - 1) marks.push({ t: seg.end, index: i, side: "end" });
-        for (const m of marks) {
-          const px = Math.abs((m.t / Math.max(0.0001, this.duration)) * rect.width - x);
-          if (px <= HIT_PX && (!best || px < best.px)) best = { ...m, px };
+      const x = xOf(e);
+      const dur = this.duration || 0;
+      let best = -1;
+      let bestPx = HIT_PX + 0.001;
+      this.boundaries().forEach((t, b) => {
+        const px = Math.abs((t / Math.max(0.0001, dur)) * rect.width - x);
+        if (px <= bestPx) {
+          bestPx = px;
+          best = b;
         }
-      }
+      });
       return best;
     };
 
     cv.addEventListener("pointerdown", (e) => {
       e.stopPropagation();
-      if (!this.segments.length) return;
+      if (!this.segments.length || e.button !== 0) return;
 
-      const edge = hitEdge(e);
-      if (edge && e.button === 0) {
-        // 拖切点：只改这个边界，两侧段的另一头不动
-        this.drag = { index: edge.index, side: edge.side, lastX: e.clientX };
+      const b = hitEdge(e);
+      if (b >= 0) {
+        // 抓切点：按住就跟着鼠标走，不再算增量（增量累计容易丢帧、还会跑偏）
+        this.drag = { b };
+        this.cursor = timeAt(e);
         cv.setPointerCapture?.(e.pointerId);
+        cv.style.cursor = "ew-resize";
         e.preventDefault();
+        this.draw();
         return;
       }
 
-      // 点段内 → 选中（单段模式下顺便把「当前段」同步过去）
+      // 点段内 → 定位光标 + 选中（单段模式下顺便把「当前段」同步过去）
       const t = timeAt(e);
       const idx = this.segments.findIndex((s) => t >= s.start && t <= s.end);
-      if (idx >= 0) {
-        this.setActive(idx, true);
-      }
+      this.cursor = t;
+      if (idx >= 0) this.setActive(idx, true);
+      else this.draw();
     });
 
     cv.addEventListener("pointermove", (e) => {
+      const b = hitEdge(e);
       if (!this.drag) {
-        // 光标提示：靠近切点显示横向拖动
-        const edge = hitEdge(e);
-        cv.style.cursor = edge ? "ew-resize" : "pointer";
+        if (b !== this.hoverB) {
+          this.hoverB = b;
+          this.draw();
+        }
+        cv.style.cursor = b >= 0 ? "ew-resize" : "pointer";
         return;
       }
       e.stopPropagation();
-      const rect = cv.getBoundingClientRect();
-      const dt = ((e.clientX - this.drag.lastX) / Math.max(1, rect.width)) * (this.duration || 0);
-      this.drag.lastX = e.clientX;
-      this.moveEdge(this.drag.index, this.drag.side, dt);
+      this.moveBoundary(this.drag.b, timeAt(e));
     });
 
     const endDrag = (e) => {
       if (!this.drag) return;
       this.drag = null;
-      cv.releasePointerCapture?.(e.pointerId);
-      this.commit();          // 拖动结束才写回 widget
+      try {
+        cv.releasePointerCapture?.(e.pointerId);
+      } catch (err) {
+        /* 已经释放过就算了 */
+      }
+      // 拖动结束才写回 widget：拖动中每帧写会不停触发工作流变脏
+      this.commit();
       this.renderList();
+      this.draw();
     };
     cv.addEventListener("pointerup", endDrag);
     cv.addEventListener("pointercancel", endDrag);
+    cv.addEventListener("pointerleave", () => {
+      if (this.drag) return;          // 拖出去了也不能清掉悬停态
+      if (this.hoverB !== -1) {
+        this.hoverB = -1;
+        this.draw();
+      }
+    });
 
     // 双击段内 → 在那里切一刀
     cv.addEventListener("dblclick", (e) => {
       e.stopPropagation();
       if (!this.segments.length) return;
-      const t = timeAt(e);
-      this.splitAt(t);
+      this.splitAt(timeAt(e));
     });
   }
 
-  /** 拖某条边界 dt 秒 */
-  moveEdge(index, side, dt) {
-    const seg = this.segments[index];
-    if (!seg) return;
+  /**
+   * 把第 b 条切点线挪到 `time`。
+   *
+   * 中间那条线同时改两侧（左段 end / 右段 start），所以永远共边、不产生空洞；
+   * 两端的线只夹住自己那一侧。相邻段的另一头保持不动，因此单段最短可能被压到
+   * MIN_GAP —— 但不会像以前那样把整段压成 0.06 秒还不自知。
+   */
+  moveBoundary(b, time) {
+    const segs = this.segments;
+    const n = segs.length;
+    if (!n) return;
 
-    if (side === "end") {
-      seg.end = Math.max(seg.start + MIN_GAP, Math.min(this.duration, seg.end + dt));
+    const dur = this.duration || segs[n - 1].end;
+    const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), Math.max(lo, hi));
+    const t = clamp(Number(time) || 0, 0, dur);
+
+    if (b <= 0) {
+      const first = segs[0];
+      first.start = clamp(t, 0, first.end - MIN_GAP);
+    } else if (b >= n) {
+      const last = segs[n - 1];
+      last.end = clamp(t, last.start + MIN_GAP, dur);
     } else {
-      const lower = index > 0 ? this.segments[index - 1].start + MIN_GAP : 0;
-      seg.start = Math.min(seg.end - MIN_GAP, Math.max(lower, seg.start + dt));
+      const left = segs[b - 1];
+      const right = segs[b];
+      const lo = left.start + MIN_GAP;
+      const hi = right.end - MIN_GAP;
+      const v = clamp(t, lo, hi);
+      left.end = v;
+      right.start = v;                 // ← 关键：另一侧跟着走
     }
+
+    this.cursor = t;
     // 拖动过程中**只重画画布**：段清单里有输入框，每帧重建 DOM 会打断输入、
     // 段数多时也卡。清单等 pointerup 时再重建（见 bindCanvas 的 endDrag）。
     this.draw();
@@ -431,22 +501,63 @@ class AudioSplitPanel {
 
   /* ---------------- 分段操作 ---------------- */
 
+  /**
+   * 把分段表修成「首尾相接、没有空洞、没有碎段」。
+   *
+   * 老版本拖边界只改一侧，会存下带空洞的表（0.06 秒的碎段就是这么来的）。
+   * 加载和写回时都过一遍：有空洞就用前一段的 end 补上，短于 MIN_GAP 的并进前一段，
+   * 提示词保留。这个节点没有「跳过某段音频」的用法，空洞一律视为脏数据。
+   */
+  normalizeSegments() {
+    if (!this.segments.length) return;
+    const dur = this.duration || this.segments[this.segments.length - 1].end;
+    const out = [];
+    for (const raw of this.segments) {
+      const start = Math.max(0, Math.min(Number(raw.start) || 0, dur));
+      const end = Math.max(start, Math.min(Number(raw.end) || 0, dur));
+      const prompt = String(raw.prompt || "");
+      if (!out.length) {
+        if (end - start >= MIN_GAP) out.push({ start, end, prompt });
+        continue;
+      }
+      const prev = out[out.length - 1];
+      const st = prev.end;                        // 强制共边
+      // 留 1e-6 的余量：12.06 - 12 在浮点里是 0.0600000000000005，直接和 0.06 比会漏掉
+      if (end - st <= MIN_GAP + 1e-6) {
+        prev.end = Math.max(prev.end, end);       // 碎段（含正好 0.06 秒的）并进前一段
+        if (!prev.prompt) prev.prompt = prompt;
+      } else {
+        out.push({ start: st, end, prompt });
+      }
+    }
+    if (out.length) this.segments = out;
+  }
+
   splitAt(time) {
     const t = Number(time);
     if (!Number.isFinite(t)) return;
     const idx = this.segments.findIndex((s) => t > s.start + MIN_GAP && t < s.end - MIN_GAP);
-    if (idx < 0) return;
+    if (idx < 0) {
+      this.flash("这个位置切不开：太靠近已有切点（至少留 0.06 秒）");
+      return;
+    }
     const seg = this.segments[idx];
     const right = { start: t, end: seg.end, prompt: "" };
     seg.end = t;
     this.segments.splice(idx + 1, 0, right);
+    this.cursor = t;
     this.setActive(idx, false);
     this.commit();
     this.renderList();
     this.draw();
   }
 
-  /** 「加切点」：在没有分段时从整段音频切一刀；有分段时在选中段中点切 */
+  /**
+   * 「加切点」：在**光标处**切（先在波形上点一下定位）；没点过光标就切选中段中点。
+   *
+   * 以前固定切中点，在 4 分半的整段音频上连点几次会切出「0–18 秒 + 一堆 0.06 秒碎段」，
+   * 用户根本没法预期切在哪。
+   */
   cutAtPlayhead() {
     if (!this.duration) {
       this.flash("先选音频");
@@ -454,9 +565,13 @@ class AudioSplitPanel {
     }
     if (!this.segments.length) {
       this.segments = [{ start: 0, end: this.duration, prompt: "" }];
+      this.commit();
+      this.renderList();
     }
     const seg = this.segments[this.active] || this.segments[0];
-    this.splitAt((seg.start + seg.end) / 2);
+    const inside = this.cursor >= seg.start + MIN_GAP && this.cursor <= seg.end - MIN_GAP;
+    const t = inside ? this.cursor : (seg.start + seg.end) / 2;
+    this.splitAt(t);
   }
 
   splitEvenly() {
@@ -510,6 +625,7 @@ class AudioSplitPanel {
   setActive(index, syncWidget) {
     this.active = Math.max(0, Math.min(index, this.segments.length - 1));
     if (syncWidget) this.writeWidget("当前段", this.active + 1);
+    this.updatePlayButton();
     this.renderList();
     this.draw();
   }
@@ -611,6 +727,41 @@ class AudioSplitPanel {
     this.audioEl.addEventListener("ended", () => this.stopPlay());
   }
 
+  /** 试听按钮的文案：直接写"第几段"，省得用户猜在放哪段 */
+  updatePlayButton() {
+    if (!this.btnPlay) return;
+    if (this.playing >= 0) {
+      const seg = this.segments[this.playing];
+      const range = seg ? ` · ${fmtTime(seg.start)}` : "";
+      this.btnPlay.textContent = `■ 停止试听（第 ${this.playing + 1} 段${range}）`;
+      this.btnPlay.title = "停下";
+    } else if (this.segments.length) {
+      this.btnPlay.textContent = `▶ 试听第 ${this.active + 1} 段`;
+      this.btnPlay.title = "从这一段的开头播到段尾，播到段尾自动停";
+    } else {
+      this.btnPlay.textContent = "▶ 试听本段";
+      this.btnPlay.title = "还没有分段";
+    }
+  }
+
+  /** 播放时每帧重画画布：让播放头和试听中的段实时跟着动 */
+  startPlayTicker() {
+    this.stopPlayTicker();
+    const tick = () => {
+      if (this.playing < 0) return;
+      this.draw();
+      this.playRaf = requestAnimationFrame(tick);
+    };
+    this.playRaf = requestAnimationFrame(tick);
+  }
+
+  stopPlayTicker() {
+    if (this.playRaf) {
+      cancelAnimationFrame(this.playRaf);
+      this.playRaf = 0;
+    }
+  }
+
   togglePlay() {
     if (this.playing >= 0) {
       this.stopPlay();
@@ -632,7 +783,10 @@ class AudioSplitPanel {
       this.stopPlay();
       this.flash("试听失败：" + err);
     });
-    this.btnPlay.textContent = "■ 停止";
+    this.updatePlayButton();
+    this.paintPlaying();
+    this.startPlayTicker();
+    this.draw();
   }
 
   stopPlay() {
@@ -642,10 +796,25 @@ class AudioSplitPanel {
     } catch (err) {
       /* 忽略 */
     }
-    this.btnPlay.textContent = "▶ 试听本段";
+    this.stopPlayTicker();
+    this.updatePlayButton();
+    this.paintPlaying();
+    this.draw();
   }
 
   /* ---------------- 绘制 ---------------- */
+
+  /** 圆角矩形路径（canvas 没内置，几行手写省得引入依赖） */
+  roundRect(ctx, x, y, w, h, r) {
+    const rr = Math.min(r, w / 2, h / 2);
+    ctx.beginPath();
+    ctx.moveTo(x + rr, y);
+    ctx.arcTo(x + w, y, x + w, y + h, rr);
+    ctx.arcTo(x + w, y + h, x, y + h, rr);
+    ctx.arcTo(x, y + h, x, y, rr);
+    ctx.arcTo(x, y, x + w, y, rr);
+    ctx.closePath();
+  }
 
   draw() {
     const ctx = this.ctx;
@@ -668,14 +837,16 @@ class AudioSplitPanel {
       return;
     }
 
-    const plotTop = WAVE_PAD + 12;      // 顶部留给时间刻度
-    const plotH = h - plotTop - 6;
+    const TOP = 18;                     // 顶部留给刻度 + 段号
+    const BOTTOM = 16;                  // 底部留给段底条
+    const plotTop = TOP;
+    const plotH = Math.max(24, h - TOP - BOTTOM);
     const midY = plotTop + plotH / 2;
-    const toX = (t) => (t / this.duration) * w;
+    const toX = (t) => (Math.min(Math.max(0, t), this.duration) / this.duration) * w;
 
-    // 时间刻度
+    // ---- 时间刻度
     const tickStep = this.duration > 120 ? 30 : this.duration > 40 ? 10 : 5;
-    ctx.strokeStyle = "rgba(120, 150, 210, 0.14)";
+    ctx.strokeStyle = "rgba(120, 150, 210, 0.13)";
     ctx.fillStyle = "#5f6a7d";
     ctx.font = "10px ui-monospace, Consolas, monospace";
     ctx.textAlign = "left";
@@ -685,57 +856,143 @@ class AudioSplitPanel {
       const x = toX(t);
       ctx.beginPath();
       ctx.moveTo(x, plotTop);
-      ctx.lineTo(x, h);
+      ctx.lineTo(x, plotTop + plotH);
       ctx.stroke();
       ctx.fillText(fmtTick(t), Math.min(x + 3, w - 26), 2);
     }
 
-    // 波形（按峰值画竖线）
+    // ---- 段底色：奇偶交替，让分段边界一眼可见
+    const segs = this.segments;
+    segs.forEach((seg, i) => {
+      const x1 = toX(seg.start);
+      const x2 = toX(seg.end);
+      const sw = Math.max(1, x2 - x1);
+      if (i % 2 === 1) {
+        ctx.fillStyle = "rgba(255, 255, 255, 0.045)";
+        ctx.fillRect(x1, plotTop, sw, plotH);
+      }
+    });
+
+    // ---- 波形本身（按段画，段内色调统一）
     const n = this.peaks.length;
     if (n) {
       const barW = Math.max(1, w / n);
-      ctx.fillStyle = "#3d6fbf";
       for (let i = 0; i < n; i += 1) {
+        const t = (i / n) * this.duration;
+        const segIndex = this.segments.findIndex((s) => t >= s.start && t < s.end);
+        const playing = segIndex >= 0 && segIndex === this.playing;
+        const active = segIndex >= 0 && segIndex === this.active;
+        ctx.fillStyle = playing ? "#5fe0ad" : active ? "#5f92e8" : "#3d6fbf";
         const amp = Math.max(0.5, (this.peaks[i] || 0) * plotH * 0.46);
         const x = (i / n) * w;
         ctx.fillRect(x, midY - amp, barW, amp * 2);
       }
     }
 
-    // 段底色 + 选中高亮
-    this.segments.forEach((seg, i) => {
+    // ---- 选中 / 试听：着色 + 顶部状态条 + 段号 chip
+    segs.forEach((seg, i) => {
       const x1 = toX(seg.start);
       const x2 = toX(seg.end);
-      if (i === this.active) {
-        ctx.fillStyle = "rgba(110, 160, 255, 0.20)";
-        ctx.fillRect(x1, plotTop, x2 - x1, plotH);
-      }
-      // 段边界
-      ctx.strokeStyle = "rgba(255, 255, 255, 0.55)";
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(x1 + 0.5, plotTop);
-      ctx.lineTo(x1 + 0.5, plotTop + plotH);
-      ctx.stroke();
+      const sw = Math.max(1, x2 - x1);
+      const isActive = i === this.active;
+      const isPlaying = i === this.playing;
 
-      // 段号
-      if (x2 - x1 > 16) {
-        ctx.fillStyle = "#e6edf9";
-        ctx.font = "bold 11px ui-monospace, Consolas, monospace";
+      if (isActive && !isPlaying) {
+        ctx.fillStyle = "rgba(96, 150, 255, 0.13)";
+        ctx.fillRect(x1, plotTop, sw, plotH);
+      }
+      if (isPlaying) {
+        ctx.fillStyle = "rgba(63, 211, 154, 0.16)";
+        ctx.fillRect(x1, plotTop, sw, plotH);
+      }
+
+      // 顶部 3px 状态条：选中蓝、试听绿
+      if (isActive || isPlaying) {
+        ctx.fillStyle = isPlaying ? "#3fd39a" : "#5b8dff";
+        ctx.fillRect(x1 + 1, plotTop, Math.max(0, sw - 2), 3);
+      }
+
+      // 底部段条：每条段一个色块，宽度恒定 4px，分段多的时候也看得清
+      ctx.fillStyle = isPlaying
+        ? "#3fd39a"
+        : isActive
+          ? "#5b8dff"
+          : i % 2 === 0
+            ? "rgba(120, 150, 210, 0.55)"
+            : "rgba(120, 150, 210, 0.3)";
+      ctx.fillRect(x1 + 1, plotTop + plotH + 3, Math.max(0, sw - 2), 4);
+
+      // 段号 chip（段太窄就只显示选中的那条）。落在波形区顶部而不是刻度那一行，
+      // 否则会和 0:05 这类刻度文字叠在一起
+      const drawChip = sw > 16 || isActive || isPlaying;
+      if (drawChip) {
+        const label = String(i + 1);
+        ctx.font = "bold 10px ui-monospace, Consolas, monospace";
+        const tw = ctx.measureText(label).width;
+        const cw = tw + 8;
+        const cx = Math.min(x1 + 2, w - cw - 1);
+        const chipY = plotTop + 2;
+        ctx.fillStyle = isPlaying
+          ? "rgba(20, 90, 66, 0.95)"
+          : isActive
+            ? "rgba(28, 56, 110, 0.95)"
+            : "rgba(12, 16, 23, 0.78)";
+        this.roundRect(ctx, cx, chipY, cw, 13, 3);
+        ctx.fill();
+        ctx.fillStyle = isPlaying ? "#c8ffe8" : isActive ? "#dbe8ff" : "#93a3bb";
         ctx.textAlign = "left";
         ctx.textBaseline = "top";
-        ctx.fillText(String(i + 1), x1 + 4, plotTop + 3);
+        ctx.fillText(label, cx + 4, chipY + 1);
+
+        // 时长：段宽够就写在右下角
+        if (sw > 62) {
+          const dur = `${(seg.end - seg.start).toFixed(seg.end - seg.start < 10 ? 2 : 1)}s`;
+          ctx.font = "10px ui-monospace, Consolas, monospace";
+          ctx.fillStyle = isPlaying ? "rgba(200, 255, 232, 0.9)" : "rgba(190, 205, 228, 0.75)";
+          ctx.textAlign = "right";
+          ctx.textBaseline = "bottom";
+          ctx.fillText(dur, Math.max(x1 + 4, x2 - 9), plotTop + plotH - 2);
+        }
       }
     });
 
-    // 最后一段的右边界
-    const last = this.segments[this.segments.length - 1];
-    if (last) {
-      ctx.strokeStyle = "rgba(255, 255, 255, 0.55)";
+    // ---- 切点线 + 抓手（每条都能拖，手感一致）
+    this.boundaries().forEach((t, b) => {
+      const x = toX(t);
+      const hot = this.drag ? this.drag.b === b : this.hoverB === b;
+      ctx.strokeStyle = hot ? "#a9c9ff" : "rgba(233, 240, 252, 0.78)";
+      ctx.lineWidth = hot ? 2.5 : 1.5;
       ctx.beginPath();
-      ctx.moveTo(toX(last.end) - 0.5, plotTop);
-      ctx.lineTo(toX(last.end) - 0.5, plotTop + plotH);
+      ctx.moveTo(x, plotTop);
+      ctx.lineTo(x, plotTop + plotH);
       ctx.stroke();
+
+      // 中间那颗抓手：告诉用户"这条线能拖"
+      ctx.fillStyle = hot ? "#a9c9ff" : "rgba(219, 232, 252, 0.9)";
+      this.roundRect(ctx, x - 3, midY - 11, 6, 22, 3);
+      ctx.fill();
+      ctx.fillStyle = "rgba(20, 26, 36, 0.85)";
+      ctx.fillRect(x - 1, midY - 6, 2, 12);
+    });
+
+    // ---- 播放头（试听中实线 + 光晕；光标位置虚线）
+    if (this.playing >= 0) {
+      const x = toX(this.audioEl.currentTime || 0);
+      ctx.fillStyle = "rgba(63, 211, 154, 0.22)";
+      ctx.fillRect(x - 3, plotTop, 6, plotH);
+      ctx.fillStyle = "#3fd39a";
+      ctx.fillRect(x - 1, plotTop, 2, plotH);
+    } else if (this.cursor >= 0 && this.cursor <= this.duration) {
+      const x = toX(this.cursor);
+      ctx.save();
+      ctx.setLineDash([3, 3]);
+      ctx.strokeStyle = "rgba(143, 180, 255, 0.85)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x + 0.5, plotTop);
+      ctx.lineTo(x + 0.5, plotTop + plotH);
+      ctx.stroke();
+      ctx.restore();
     }
   }
 
@@ -743,6 +1000,7 @@ class AudioSplitPanel {
 
   renderList() {
     this.listEl.textContent = "";
+    this.rows = [];
     if (!this.segments.length) {
       const hint = document.createElement("div");
       hint.className = "dk-as-empty";
@@ -755,11 +1013,17 @@ class AudioSplitPanel {
 
     this.segments.forEach((seg, i) => {
       const row = document.createElement("div");
-      row.className = "dk-as-row" + (i === this.active ? " dk-as-row--active" : "");
+      const isPlaying = i === this.playing;
+      const isActive = i === this.active;
+      row.className =
+        "dk-as-row" +
+        (isActive ? " dk-as-row--active" : "") +
+        (isPlaying ? " dk-as-row--playing" : "");
 
       const idx = document.createElement("span");
       idx.className = "dk-as-idx";
-      idx.textContent = String(i + 1);
+      idx.textContent = isPlaying ? "♪" : String(i + 1);
+      idx.title = isPlaying ? "正在试听这一段" : "";
 
       const time = document.createElement("span");
       time.className = "dk-as-time";
@@ -767,6 +1031,10 @@ class AudioSplitPanel {
       time.title = "点击试听这一段";
       time.addEventListener("click", () => {
         this.setActive(i, true);
+        if (this.playing === i) {
+          this.stopPlay();
+          return;
+        }
         this.stopPlay();
         this.togglePlay();
       });
@@ -790,7 +1058,20 @@ class AudioSplitPanel {
 
       row.append(idx, time, input, del);
       this.listEl.appendChild(row);
+      this.rows.push({ row, idx, time });
     });
+  }
+
+  /** 只改试听高亮，不重建 DOM —— 重建会把用户正在输入的提示词冲掉 */
+  paintPlaying() {
+    this.rows.forEach((ref, i) => {
+      const isPlaying = i === this.playing;
+      ref.row.classList.toggle("dk-as-row--playing", isPlaying);
+      ref.idx.textContent = isPlaying ? "♪" : String(i + 1);
+      ref.idx.title = isPlaying ? "正在试听这一段" : "";
+    });
+    const ref = this.rows[this.playing];
+    if (ref) ref.row.scrollIntoView({ block: "nearest" });
   }
 
   /* ---------------- 读写 widget ---------------- */
@@ -825,6 +1106,7 @@ class AudioSplitPanel {
   }
 
   commit() {
+    this.normalizeSegments();
     const data = {
       segments: this.segments.map((s) => ({
         start: Number(s.start.toFixed(3)),
@@ -837,7 +1119,9 @@ class AudioSplitPanel {
 
   restore() {
     this.segments = readSegments(this.readWidget("分段数据"));
+    this.normalizeSegments();
     this.active = Math.max(0, Math.min(this.active, this.segments.length - 1));
+    this.updatePlayButton();
     this.renderList();
     this.resize();
     if (this.readWidget("文件路径")) this.loadPeaks(false);
