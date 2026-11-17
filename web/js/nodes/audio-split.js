@@ -543,11 +543,16 @@ class AudioSplitPanel {
     }
 
     this.nameEl.textContent = "解码中…";
+    // 超时兜底：后端解码要是卡住（以前 torchaudio 弹 DLL 框就是这种），
+    // 不加这道兜底，界面就永远停在「解码中…」，用户只能重启。
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 25000);
     try {
       const res = await api.fetchApi("/dogking-tools/audio_peaks", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ path, buckets: 1600 }),
+        signal: ctrl.signal,
       });
       const data = await res.json();
       if (!data?.ok) {
@@ -576,8 +581,15 @@ class AudioSplitPanel {
       this.renderList();
       this.draw();
     } catch (err) {
-      this.nameEl.textContent = "请求失败";
-      this.flash("音频解码请求失败：" + err);
+      const aborted = err?.name === "AbortError";
+      this.nameEl.textContent = aborted ? "解码超时" : "请求失败";
+      this.flash(
+        aborted
+          ? "后端解码超时：音频可能太大或格式不支持。换 wav/mp3 再试，或看控制台报错"
+          : "音频解码请求失败：" + err
+      );
+    } finally {
+      clearTimeout(timer);
     }
   }
 

@@ -311,12 +311,132 @@ def test_compute_peaks_more_buckets_than_samples_is_clamped():
     assert len(peaks) == 10                     # 桶数不能超过样本数
 
 
+# ---------------------------------------------------------------- 解码链
+#
+# 🔴 这一组守的是「别再走 torchaudio」：这台机器的 torchaudio 把解码交给
+#    torchcodec，而它的 DLL 和 torch 版本对不上 → 弹「无法定位程序输入点」，
+#    模态框不点掉请求就卡死，面板永远停在「解码中…」。
+
+
+def _tiny_wav(prefix="dk_decode_"):
+    """写一个 0.25 秒的立体声 wav，返回路径。"""
+    import math
+    import tempfile
+
+    path = os.path.join(tempfile.mkdtemp(prefix=prefix), "tone.wav")
+    rate = 8000
+    with wave.open(path, "wb") as fh:
+        fh.setnchannels(2)
+        fh.setsampwidth(2)
+        fh.setframerate(rate)
+        data = bytearray()
+        for i in range(int(rate * 0.25)):
+            value = int(8000 * math.sin(2 * math.pi * 220 * i / rate))
+            data += int(value).to_bytes(2, "little", signed=True) * 2
+        fh.writeframes(bytes(data))
+    return path, rate
+
+
+def test_load_waveform_never_touches_torchaudio():
+    """解码链里不能再出现 torchaudio —— 它一被 import 就可能触发 torchcodec。"""
+    import ast
+
+    src = open(os.path.join(HERE, "audio_split.py"), encoding="utf-8").read()
+    tree = ast.parse(src)
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            names = [a.name for a in node.names]
+            if isinstance(node, ast.ImportFrom):
+                names.append(node.module or "")
+            assert not any("torchaudio" in n for n in names), (
+                "audio_split.py 又 import torchaudio 了 —— 这台机器上它会拉起 torchcodec "
+                "并弹「无法定位程序输入点」的模态框，面板会卡在「解码中…」"
+            )
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr == "load"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "torchaudio"
+        ):
+            raise AssertionError("又用 torchaudio.load() 解码了")
+
+    path, rate = _tiny_wav()
+    wav, got_rate = _av.load_waveform(path)
+    assert got_rate == rate
+    assert tuple(wav.shape) == (2, int(rate * 0.25))
+
+
+def test_load_waveform_falls_back_to_av(monkeypatch):
+    """soundfile 读不了（比如某些容器）时，PyAV 要能顶上。"""
+    import soundfile
+
+    real_read = soundfile.read
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("libsndfile 不支持这个格式")
+
+    monkeypatch.setattr(soundfile, "read", _boom)
+    path, rate = _tiny_wav("dk_decode_av_")
+    try:
+        wav, got_rate = _av.load_waveform(path)
+    finally:
+        monkeypatch.setattr(soundfile, "read", real_read)
+
+    assert got_rate == rate
+    assert tuple(wav.shape) == (2, int(rate * 0.25))
+
+
+def test_load_waveform_falls_back_to_stdlib_wave(monkeypatch):
+    """soundfile 和 PyAV 都不可用时，纯 wav 还得能读。"""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _blocked(name, *args, **kwargs):
+        if name in ("soundfile", "av"):
+            raise ImportError("模拟没装 %s" % name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _blocked)
+    path, rate = _tiny_wav("dk_decode_wave_")
+    try:
+        wav, got_rate = _av.load_waveform(path)
+    finally:
+        monkeypatch.setattr(builtins, "__import__", real_import)
+
+    assert got_rate == rate
+    assert tuple(wav.shape) == (2, int(rate * 0.25))
+    assert float(wav.abs().max()) > 0.1
+
+
+def test_load_waveform_reports_all_failures():
+    """三种方式全失败时报错要带上各自原因，别只说一句「解码失败」。"""
+    import tempfile
+
+    path = os.path.join(tempfile.mkdtemp(prefix="dk_decode_bad_"), "bad.mp3")
+    with open(path, "wb") as fh:
+        fh.write(b"not audio at all")
+    with pytest.raises(ValueError) as err:
+        _av.load_waveform(path)
+    message = str(err.value)
+    assert "soundfile" in message and "pyav" in message and "wave" in message
+
+
+
 # ---------------------------------------------------------------- 直接运行
 
 if __name__ == "__main__":
-    passed = failed = 0
+    import inspect
+
+    passed = failed = skipped = 0
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
+            # 依赖 pytest fixture（monkeypatch 等）的用例直接运行时没法给参数，跳过
+            if inspect.signature(fn).parameters:
+                print(f"SKIP {name}（需要 pytest fixture）")
+                skipped += 1
+                continue
             # pytest 里靠 autouse fixture 清游标，直接运行时没有 fixture，手动清
             _av._MEM_STATE.clear()
             try:
@@ -326,5 +446,5 @@ if __name__ == "__main__":
             except Exception as exc:  # noqa: BLE001
                 print(f"FAIL {name}: {exc}")
                 failed += 1
-    print(f"\n通过 {passed} / 失败 {failed}")
+    print(f"\n通过 {passed} / 失败 {failed} / 跳过 {skipped}")
     sys.exit(1 if failed else 0)

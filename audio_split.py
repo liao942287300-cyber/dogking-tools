@@ -184,44 +184,106 @@ def resolve_audio_path(path):
 
 def load_waveform(path):
     """
-    读音频文件 → `(waveform[C,L] 或 [1,C,L], sample_rate)`。
+    读音频文件 → `(waveform[C,L], sample_rate)`。
 
-    torchaudio 优先（wav/mp3/flac 都认）；它不可用时退到标准库 wave，
-    至少保证 wav 能读 —— 别因为一个依赖缺失让整个节点不可用。
+    🔴 **绝不要用 `torchaudio.load()`。** 这台机器的 torchaudio 2.10 把解码全部交给
+    torchcodec，而 `python_embeded` 里那个 torchcodec 的 DLL 和 torch 版本对不上 ——
+    一调用就弹 Windows 的「无法定位程序输入点 torch_dtype_float8_e8m0fnu 于
+    libtorchcodec_image.dll」，那个模态框不点掉，请求线程就一直卡着，
+    面板永远停在「解码中…」。
+
+    所以解码走这条链，全是纯 Python / 自带二进制，不碰 torch 的音频后端：
+        ① soundfile（libsndfile）—— wav / flac / ogg / mp3，最快
+        ② PyAV（ffmpeg 绑定）—— m4a / mp4 / aac / webm 这些容器，视频里抽音轨也行
+        ③ 标准库 wave —— 前两个都没装时，至少 wav 还能读
+
+    @returns {(torch.Tensor, int)} waveform 形状 [C, L]，float32
+    @throws {ValueError} 三种方式都读不出来
     """
-    try:
-        import torchaudio
-
-        wav, sr = torchaudio.load(path)
-        return wav, int(sr)
-    except Exception:
-        pass
-
-    import wave
-
     import numpy as np
     import torch
 
-    with wave.open(path, "rb") as fh:
-        channels = fh.getnchannels()
-        width = fh.getsampwidth()
-        sr = fh.getframerate()
-        raw = fh.readframes(fh.getnframes())
+    errors = []
 
-    dtype = {1: np.uint8, 2: np.int16, 4: np.int32}.get(width)
-    if dtype is None:
-        raise ValueError("不支持的 wav 位深：%s 字节" % width)
-    data = np.frombuffer(raw, dtype=dtype).astype(np.float32)
-    if dtype is np.uint8:
-        data = (data - 128.0) / 128.0
-    else:
-        data = data / float(np.iinfo(dtype).max)
-    if channels > 1:
-        data = data.reshape(-1, channels).T
-        wav = torch.from_numpy(data)
-    else:
-        wav = torch.from_numpy(data).unsqueeze(0)
-    return wav, int(sr)
+    # ① soundfile
+    try:
+        import soundfile as sf
+
+        data, sr = sf.read(path, dtype="float32", always_2d=True)  # [L, C]
+        if data.size:
+            return torch.from_numpy(np.ascontiguousarray(data.T)), int(sr)
+        errors.append("soundfile: 文件里没有采样点")
+    except Exception as e:  # noqa: BLE001
+        errors.append("soundfile: %s" % e)
+
+    # ② PyAV
+    try:
+        wav, sr = _load_with_av(path)
+        return wav, sr
+    except Exception as e:  # noqa: BLE001
+        errors.append("pyav: %s" % e)
+
+    # ③ 标准库 wave
+    try:
+        import wave
+
+        with wave.open(path, "rb") as fh:
+            channels = fh.getnchannels()
+            width = fh.getsampwidth()
+            sr = fh.getframerate()
+            raw = fh.readframes(fh.getnframes())
+
+        dtype = {1: np.uint8, 2: np.int16, 4: np.int32}.get(width)
+        if dtype is None:
+            raise ValueError("不支持的 wav 位深：%s 字节" % width)
+        data = np.frombuffer(raw, dtype=dtype).astype(np.float32)
+        if dtype is np.uint8:
+            data = (data - 128.0) / 128.0
+        else:
+            data = data / float(np.iinfo(dtype).max)
+        if channels > 1:
+            data = data.reshape(-1, channels).T
+        else:
+            data = data.reshape(1, -1)
+        return torch.from_numpy(np.ascontiguousarray(data)), int(sr)
+    except Exception as e:  # noqa: BLE001
+        errors.append("wave: %s" % e)
+
+    raise ValueError("解码失败（%s）" % "；".join(errors))
+
+
+def _load_with_av(path):
+    """
+    用 PyAV 解码任意容器 → `(waveform[C,L], sample_rate)`。
+
+    先交给 AudioResampler 转成 `fltp`（planar float32）：容器里的原始格式可能是
+    s16 / flt / packed 交错，形状随格式变，直接 `to_ndarray()` 出来的布局不一致，
+    重采样器统一之后拿到的永远是 [C, L]。
+    """
+    import av
+    import numpy as np
+    import torch
+
+    with av.open(path) as container:
+        stream = next((s for s in container.streams if s.type == "audio"), None)
+        if stream is None:
+            raise ValueError("这个文件里没有音频轨")
+
+        rate = int(stream.rate or 0)
+        layout = stream.layout.name or "stereo"
+        resampler = av.AudioResampler(format="fltp", layout=layout, rate=rate)
+
+        blocks = []
+        for frame in container.decode(stream):
+            for out in resampler.resample(frame):
+                blocks.append(out.to_ndarray())
+        for out in resampler.resample(None):  # 冲掉尾部缓冲
+            blocks.append(out.to_ndarray())
+
+    if not blocks:
+        raise ValueError("解码出来是空的")
+    data = np.concatenate(blocks, axis=1).astype(np.float32, copy=False)
+    return torch.from_numpy(np.ascontiguousarray(data)), rate
 
 
 def to_comfy_audio(waveform, sample_rate):

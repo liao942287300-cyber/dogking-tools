@@ -612,6 +612,13 @@ PromptVault 的 `js/png-meta.js` 按这个顺序识别：`parameters` → `promp
 
 浏览器解码各家格式行为不一致（mp3 时长有偏差、m4a 看系统），这也是走后端的原因。
 
+**解码链：soundfile（libsndfile）→ PyAV → 标准库 wave**，三级依次降级。
+故意**不用 `torchaudio.load()`** —— 新版 torchaudio 把解码外包给 torchcodec，
+而 `python_embeded` 里的 torchcodec DLL 常和 torch 版本对不上，一调用就弹
+「无法定位程序输入点 torch_dtype_float8_e8m0fnu 于 libtorchcodec_image.dll」，
+那个模态框不点掉，请求线程一直卡着、面板永远停在「解码中…」。
+mp4 这类容器里的音轨也走 PyAV，能直接抽出来。
+
 ### 注意
 
 - 支持的格式：wav / mp3 / flac / ogg / m4a / aac / opus / wma。读不出来时面板会说明，不报红。
@@ -623,7 +630,7 @@ PromptVault 的 `js/png-meta.js` 按这个顺序识别：`parameters` → `promp
 
 ## 跑测试
 
-### Python 测试（151 条）
+### Python 测试（155 条）
 
 ```bash
 # 全部测试（推荐）
@@ -634,7 +641,7 @@ python tests/test_pv_nodes.py        # 36 条
 python tests/test_pv_store.py        # 32 条
 python tests/test_pv_asset_nodes.py  # 22 条
 python tests/test_pv_meta.py         # 25 条
-python tests/test_audio_split.py     # 28 条
+python tests/test_audio_split.py     # 32 条
 python tests/test_pv_client.py       # 53 条断言（脚本式）
 ```
 
@@ -644,7 +651,7 @@ python tests/test_pv_client.py       # 53 条断言（脚本式）
 | `test_pv_store.py` | 32 | 缓存 TTL 与淘汰 / 分页边界 / 搜索 / 随机 / 缩略图 LRU |
 | `test_pv_asset_nodes.py` | 22 | 节点 3、4 的**每个 return 点**（按出口组织，不按功能点） |
 | `test_pv_meta.py` | 25 | 参数扫描（含「全图没有 steps」的 sigmas 工作流）/ 参数行不得污染负向词 / iTXt 中文往返 |
-| `test_audio_split.py` | 28 | 分段表容错 / 秒→采样点换算 / 游标推进与归零 / 改切点重置而改提示词不重置 / 提示词覆盖优先级 / 波形峰值归一化 |
+| `test_audio_split.py` | 32 | 分段表容错 / 秒→采样点换算 / 游标推进与归零 / 改切点重置而改提示词不重置 / 提示词覆盖优先级 / 波形峰值归一化 / 三级解码链（不碰 torchaudio） |
 | `test_pv_client.py` | 1（包装） | HTTP 层的 `includeChildren` 等不变量（53 条 `check()` 在 import 时跑完，末尾用一条包装交给 pytest） |
 
 > ⚠️ **`tests/conftest.py` 不是装饰品，别删。**
