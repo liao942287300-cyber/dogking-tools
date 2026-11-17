@@ -187,7 +187,7 @@ def test_node_sequence_walks_and_wraps():
     node = _av.DogkingAudioSplit()
     segs = _segments((0, 1, ""), (1, 2, ""), (2, 3, ""))
 
-    seen = [_run(node, segs)["result"][3] for _ in range(4)]
+    seen = [_run(node, segs)["result"][2] for _ in range(4)]
     # 三轮走完，第四轮回到第一段
     assert seen == [1, 2, 3, 1]
 
@@ -196,15 +196,15 @@ def test_node_single_mode_ignores_cursor():
     node = _av.DogkingAudioSplit()
     segs = _segments((0, 1, ""), (1, 2, ""))
     out = _run(node, segs, mode="单段", cur=2)
-    assert out["result"][3] == 2
+    assert out["result"][2] == 2
     # 连跑两次都是第 2 段（单段模式不推进游标）
-    assert _run(node, segs, mode="单段", cur=2)["result"][3] == 2
+    assert _run(node, segs, mode="单段", cur=2)["result"][2] == 2
 
 
 def test_node_single_mode_clamps_cursor():
     node = _av.DogkingAudioSplit()
     segs = _segments((0, 1, ""), (1, 2, ""))
-    assert _run(node, segs, mode="单段", cur=99)["result"][3] == 2
+    assert _run(node, segs, mode="单段", cur=99)["result"][2] == 2
 
 
 def test_node_cut_change_resets_cursor():
@@ -213,7 +213,7 @@ def test_node_cut_change_resets_cursor():
     _run(node, segs_a)                      # 游标推到 1
     _run(node, segs_a)                      # 推到 2
     segs_b = _segments((0, 1.5, ""), (1.5, 3, ""))   # 切点变了
-    assert _run(node, segs_b)["result"][3] == 1
+    assert _run(node, segs_b)["result"][2] == 1
 
 
 def test_node_prompt_edits_keep_cursor():
@@ -222,7 +222,7 @@ def test_node_prompt_edits_keep_cursor():
     _run(node, segs_a)                      # → 1
     segs_b = _segments((0, 1, "新词"), (1, 2, ""), (2, 3, ""))
     # 只改了提示词：游标继续，出第 2 段
-    assert _run(node, segs_b)["result"][3] == 2
+    assert _run(node, segs_b)["result"][2] == 2
 
 
 def test_node_prompt_fallback_and_override():
@@ -230,7 +230,6 @@ def test_node_prompt_fallback_and_override():
     segs = _segments((0, 1, "独立词"), (1, 2, ""))
     out1 = _run(node, segs, mode="单段", cur=1, prompt="全局词")
     assert out1["result"][1] == "独立词"
-    assert out1["result"][2] == "全局词"     # 全局原样透传
     out2 = _run(node, segs, mode="单段", cur=2, prompt="全局词")
     assert out2["result"][1] == "全局词"
 
@@ -240,7 +239,29 @@ def test_node_returns_sliced_audio():
     segs = _segments((0.5, 1.0, ""))
     out = _run(node, segs, mode="单段", audio=_audio(3.0, 8000))
     assert int(out["result"][0]["waveform"].shape[-1]) == 4000
-    assert out["result"][5] == pytest.approx(0.5)
+    assert out["result"][4] == pytest.approx(0.5)
+
+
+def test_output_ports_have_single_prompt_port():
+    """
+    输出口只有**一个**「提示词」，不再单独开「全局提示词」。
+
+    两个口摆一起的实际后果：用户接到「全局提示词」那一路，全局词就把段内独立词
+    全顶掉了，「独立词覆盖全局」这个功能等于白做。合并成一个口，它吐的永远是
+    「该段最终该用的词」。
+    """
+    cls = _av.DogkingAudioSplit
+    assert "全局提示词" not in cls.RETURN_NAMES
+    assert cls.RETURN_NAMES.count("提示词") == 1
+    assert len(cls.RETURN_TYPES) == len(cls.RETURN_NAMES) == 5
+
+    segs = _segments((0, 1, "独立词"), (1, 2, ""))
+    node = cls()
+    with_prompt = _run(node, segs, mode="单段", cur=1, prompt="全局词")
+    without_prompt = _run(node, segs, mode="单段", cur=2, prompt="全局词")
+    assert len(with_prompt["result"]) == len(cls.RETURN_NAMES)
+    assert with_prompt["result"][1] == "独立词"      # 有独立词 → 出独立词
+    assert without_prompt["result"][1] == "全局词"   # 没独立词 → 出全局词
 
 
 def test_node_errors_are_chinese_and_actionable():

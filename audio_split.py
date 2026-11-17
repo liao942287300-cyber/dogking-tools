@@ -20,6 +20,11 @@ dogking-tools —— 数字人音频分段
 3. **提示词**：每段自己的提示词优先，空着就回退 `全局提示词` —— 这就是「独立提示词
    覆盖全局」的实现，覆盖逻辑放在后端，前端只管把两栏都填进 JSON。
 
+   输出侧**只有一个「提示词」口**，用户不用自己判断该接哪个：这个口吐出来的永远是
+   「该段最终该用的词」，有独立词就是独立词，没有才是全局词。
+   （早先还单独开过一个「全局提示词」口，实测只会让人接错 —— 接它等于把段内词全顶掉，
+   正好把覆盖功能废了。）
+
 --------------------------------------------------------------------------
 两种输出模式
 --------------------------------------------------------------------------
@@ -414,13 +419,17 @@ class DogkingAudioSplit:
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
-    RETURN_TYPES = ("AUDIO", "STRING", "STRING", "INT", "INT", "FLOAT")
-    RETURN_NAMES = ("音频", "提示词", "全局提示词", "段序号", "段数", "本段时长")
+    # 输出里**只有一个**「提示词」口：段内有独立词就出独立词，没有就出全局词。
+    # 不再单独开「全局提示词」口 —— 两个口摆在一起，用户不知道接哪个，
+    # 接错了还会把全局词无脑顶掉段内词，等于把「覆盖」功能绕过去了。
+    RETURN_TYPES = ("AUDIO", "STRING", "INT", "INT", "FLOAT")
+    RETURN_NAMES = ("音频", "提示词", "段序号", "段数", "本段时长")
     FUNCTION = "split"
     CATEGORY = "dogking-tools"
     DESCRIPTION = (
         "数字人音频分段：波形上自由切段，每段可写独立提示词（覆盖全局提示词）；"
         "支持单段输出与顺序输出（配合自动连续按段跑完整个音频）。"
+        "「提示词」输出口已合并：有独立词出独立词，没有就出全局词。"
     )
 
     @classmethod
@@ -477,7 +486,7 @@ class DogkingAudioSplit:
                 "dogking_badge": ["%d/%d · %.1fs" % (index + 1, total, duration)],
                 "dogking_index": [index + 1],
             },
-            "result": (piece, prompt, str(全局提示词 or ""), index + 1, total, duration),
+            "result": (piece, prompt, index + 1, total, duration),
         }
 
     @staticmethod

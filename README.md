@@ -588,10 +588,13 @@ PromptVault 的 `js/png-meta.js` 按这个顺序识别：`parameters` → `promp
 | 输出口 | 类型 | 说明 |
 | --- | --- | --- |
 | **音频** | AUDIO | 当前那一段（已按秒切好） |
-| **提示词** | STRING | **该段自己的提示词优先，空着回退全局** —— 这就是「独立提示词覆盖全局」 |
-| **全局提示词** | STRING | 全局原样透传（想自己写合并逻辑就接这个） |
+| **提示词** | STRING | **已经合并好的最终提示词**：该段写了独立词就出独立词，没写就出全局词 |
 | **段序号** / **段数** | INT | 接给别的节点做命名 / 判断 |
 | **本段时长** | FLOAT | 秒 |
+
+> 「全局提示词」原来还单独有一个输出口，已经删了 —— 两个口摆在一起，接到那个就等于
+> 把段内的独立词全顶掉，「覆盖」功能直接白做。现在只要接「提示词」这一个口，
+> 该用哪个由节点自己判断。
 
 ### 两种输出模式
 
@@ -630,7 +633,7 @@ mp4 这类容器里的音轨也走 PyAV，能直接抽出来。
 
 ## 跑测试
 
-### Python 测试（155 条）
+### Python 测试（156 条）
 
 ```bash
 # 全部测试（推荐）
@@ -641,7 +644,7 @@ python tests/test_pv_nodes.py        # 36 条
 python tests/test_pv_store.py        # 32 条
 python tests/test_pv_asset_nodes.py  # 22 条
 python tests/test_pv_meta.py         # 25 条
-python tests/test_audio_split.py     # 32 条
+python tests/test_audio_split.py     # 33 条
 python tests/test_pv_client.py       # 53 条断言（脚本式）
 ```
 
@@ -651,7 +654,7 @@ python tests/test_pv_client.py       # 53 条断言（脚本式）
 | `test_pv_store.py` | 32 | 缓存 TTL 与淘汰 / 分页边界 / 搜索 / 随机 / 缩略图 LRU |
 | `test_pv_asset_nodes.py` | 22 | 节点 3、4 的**每个 return 点**（按出口组织，不按功能点） |
 | `test_pv_meta.py` | 25 | 参数扫描（含「全图没有 steps」的 sigmas 工作流）/ 参数行不得污染负向词 / iTXt 中文往返 |
-| `test_audio_split.py` | 32 | 分段表容错 / 秒→采样点换算 / 游标推进与归零 / 改切点重置而改提示词不重置 / 提示词覆盖优先级 / 波形峰值归一化 / 三级解码链（不碰 torchaudio） |
+| `test_audio_split.py` | 33 | 分段表容错 / 秒→采样点换算 / 游标推进与归零 / 改切点重置而改提示词不重置 / 提示词覆盖优先级 / 波形峰值归一化 / 三级解码链（不碰 torchaudio） |
 | `test_pv_client.py` | 1（包装） | HTTP 层的 `includeChildren` 等不变量（53 条 `check()` 在 import 时跑完，末尾用一条包装交给 pytest） |
 
 > ⚠️ **`tests/conftest.py` 不是装饰品，别删。**
