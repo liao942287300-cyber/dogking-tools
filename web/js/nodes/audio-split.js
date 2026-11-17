@@ -38,7 +38,7 @@ const api = comfyAPI.api?.api;
 
 const NODE_NAME = "DogkingAudioSplit";
 /** 面板高度。给波形 150 + 工具栏 + 段清单滚动区留够空间 */
-const PANEL_HEIGHT = 452;   // 比面板内容多留一点：加了播放进度条那行
+const PANEL_HEIGHT = 476;   // 进度条 + 输出状态行各占一行
 /** 顺序模式执行完，后端发这个事件让前端自动排下一段 */
 const EVENT_NEXT = "dogking-tools.audio.next";
 /** 最小段长（秒）。比这更短的段切出来是噪音，拖到头就当合并 */
@@ -71,7 +71,41 @@ function injectStyles() {
   font: 12px/1.4 ui-monospace, Consolas, monospace;
   user-select: none;
 }
-.dk-as-bar, .dk-as-tools {
+.dk-as-bar, .dk-as-exec {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 6px;
+  border-radius: 6px;
+  background: rgba(90, 130, 220, 0.10);
+  border: 1px solid rgba(120, 150, 210, 0.22);
+}
+.dk-as-exec-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #3fd39a;
+  box-shadow: 0 0 6px rgba(63, 211, 154, 0.7);
+}
+.dk-as-exec-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: #e2ecff;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+}
+.dk-as-reset {
+  flex: 0 0 auto;
+  font-size: 12px !important;
+  padding: 2px 8px !important;
+}
+.dk-as-tools {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
@@ -388,6 +422,14 @@ class AudioSplitPanel {
     prog.append(this.progTrack, this.progLabel);
     this.bindProgress();
 
+    /* 输出状态行：模式 + 第几段/共几段 + 本段秒数（原来塞在标题栏 badge 里，太小） */
+    const exec = el("div", "dk-as-exec");
+    this.execDot = el("span", "dk-as-exec-dot");
+    this.execEl = el("span", "dk-as-exec-text", "");
+    this.btnResetSeq = el("button", "dk-as-reset", "↺ 回到第 1 段");
+    this.btnResetSeq.title = "清掉顺序游标：下次执行从第 1 段重新开始（切点和提示词都不动）";
+    exec.append(this.execDot, this.execEl, this.btnResetSeq);
+
     /* 工具行 */
     const tools = el("div", "dk-as-tools");
     this.btnCut = el("button", "", "加切点");
@@ -408,7 +450,7 @@ class AudioSplitPanel {
     /* 段清单 */
     this.listEl = el("div", "dk-as-list");
 
-    this.el.append(bar, wrap, prog, tools, this.listEl);
+    this.el.append(bar, wrap, prog, exec, tools, this.listEl);
     this.mount.appendChild(this.el);
 
     /* 事件（全部隔离，别让画布跟着动） */
@@ -427,6 +469,7 @@ class AudioSplitPanel {
     this.btnEven.addEventListener("click", () => this.splitEvenly());
     this.btnClear.addEventListener("click", () => this.clearSegments());
     this.btnRange.addEventListener("click", () => this.applyRange(0, this.duration));
+    this.btnResetSeq.addEventListener("click", () => this.resetSequence());
 
     this.bindCanvas();
 
@@ -691,6 +734,63 @@ class AudioSplitPanel {
     this.rangeEl.title = "只有选区内的音频会参与分段；拖波形最左/最右那两条线可以改";
   }
 
+  /* ---------------- 输出状态 ---------------- */
+
+  /**
+   * 面板里的输出状态行：模式 + 第几段 / 共几段 + 本段秒数。
+   *
+   * 以前把这些塞进节点标题栏的 badge，字小得看不清；现在放在面板里，
+   * 14px 加粗，配合右边的「回到第 1 段」按钮 —— 顺序跑偏了一眼就能发现并拉回来。
+   */
+  updateExecInfo() {
+    if (!this.execEl) return;
+    const mode = this.readWidget("输出模式") || "顺序";
+    const total = this.segments.length;
+    // 试听中显示正在放的那段，否则显示选中的
+    const i = this.playing >= 0 ? this.playing : this.active;
+    const seg = this.segments[i];
+    if (!seg) {
+      this.execEl.textContent = `${mode} · 还没有分段`;
+      if (this.execDot) this.execDot.style.background = "#5c6779";
+      return;
+    }
+    const len = seg.end - seg.start;
+    this.execEl.textContent = `${mode} · 第 ${i + 1} / ${total} 段 · ${len.toFixed(2)}s`;
+    if (this.execDot) {
+      this.execDot.style.background = this.playing >= 0 ? "#3fd39a" : "#5b8dff";
+    }
+  }
+
+  /**
+   * 清掉顺序游标，下次执行从第 1 段开始。
+   *
+   * 借的是「提示词批量加载」那个 /dogking-tools/reset 接口（同一个 state.json，
+   * 按节点 id 把 index 置 0）—— 不用为音频节点再开一套。
+   */
+  async resetSequence() {
+    const key = String(this.node.id ?? "");
+    try {
+      const res = await api.fetchApi("/dogking-tools/reset", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ node: key }),
+      });
+      const data = await res.json();
+      if (!data?.ok) {
+        this.flash(data?.error || "重置失败");
+        return;
+      }
+      this.stopPlay();
+      this.setActive(0, true);
+      this.updateExecInfo();
+      this.flash(this.segments.length
+        ? "已回到第 1 段，下次执行从 1 开始"
+        : "已清空顺序游标（还没有分段）");
+    } catch (err) {
+      this.flash("重置失败：" + err);
+    }
+  }
+
   /* ---------------- 分段操作 ---------------- */
 
   /**
@@ -841,6 +941,7 @@ class AudioSplitPanel {
     this.active = Math.max(0, Math.min(index, this.segments.length - 1));
     if (syncWidget) this.writeWidget("当前段", this.active + 1);
     this.updatePlayButton();
+    this.updateExecInfo();
     this.renderList();
     this.draw();
   }
@@ -918,6 +1019,7 @@ class AudioSplitPanel {
       this.paintTicks();
       this.updateRangeLabel();
       this.updatePlayButton();
+      this.updateExecInfo();
       // 换音频后播放位置归零；同一音频重载则保留原位置（够不到就夹回总长）
       this.updateProgress(Math.min(this.audioEl.currentTime || 0, this.duration));
       this.draw();
@@ -1101,6 +1203,7 @@ class AudioSplitPanel {
     });
     this.updatePlayButton();
     this.paintPlaying();
+    this.updateExecInfo();
     this.updateProgress(seg.start);
     this.startPlayTicker();
     this.draw();
@@ -1116,6 +1219,7 @@ class AudioSplitPanel {
     this.stopPlayTicker();
     this.updatePlayButton();
     this.paintPlaying();
+    this.updateExecInfo();
     this.updateProgress();
     this.draw();
   }
@@ -1387,6 +1491,7 @@ class AudioSplitPanel {
         : "选一个音频开始";
       this.listEl.appendChild(hint);
       this.paintTicks();
+      this.updateExecInfo();
       return;
     }
 
@@ -1447,6 +1552,7 @@ class AudioSplitPanel {
       this.rows.push({ row, idx, time });
     });
     this.paintTicks();
+    this.updateExecInfo();
   }
 
   /** 只改选中/试听高亮，不重建 DOM —— 重建会把用户正在输入的提示词冲掉 */
@@ -1564,6 +1670,30 @@ if (app && api) {
         });
 
         node.dkAudio = new AudioSplitPanel(node, mount);
+
+        // 改「输出模式」/「当前段」时让面板跟上：
+        // 模式影响状态行文案，当前段影响选中高亮 —— 不然要等下一次执行才刷新
+        const hook = (name, fn) => {
+          const w = (node.widgets || []).find((x) => x.name === name);
+          if (!w) return;
+          const prev = w.callback;
+          w.callback = function () {
+            const r = prev?.apply(this, arguments);
+            try {
+              fn(node, arguments[0]);
+            } catch (err) {
+              /* 面板已销毁之类的，忽略 */
+            }
+            return r;
+          };
+        };
+        hook("输出模式", (n) => n.dkAudio?.updateExecInfo());
+        hook("当前段", (n, value) => {
+          const p = n.dkAudio;
+          if (!p) return;
+          const idx = Math.max(0, Math.round(Number(value) || 1) - 1);
+          if (idx !== p.active) p.setActive(idx, false);
+        });
         return ret;
       };
 
@@ -1582,28 +1712,12 @@ if (app && api) {
       const onExecuted = nodeType.prototype.onExecuted;
       nodeType.prototype.onExecuted = function (message) {
         onExecuted?.apply(this, arguments);
-        const badge = message?.dogking_badge?.[0];
-        const Badge = window.LGraphBadge;
-        if (badge && typeof Badge === "function") {
-          try {
-            this.badges = [new Badge({
-              text: badge,
-              bgColor: "#24406e",
-              fgColor: "#cfe0ff",
-              fontSize: 11,
-              height: 18,
-              padding: 7,
-              cornerRadius: 9,
-              xOffset: -Math.round(badge.length * 11 * 0.35),
-            })];
-          } catch (err) {
-            this.badges = [];
-          }
-        }
-        // 面板跟着更新「当前段」高亮
+        // 标题栏 badge 已经去掉：那几个数字放在节点顶部又小又挡事，
+        // 现在改到面板里的输出状态行（14px），空间大、还能顺手点「回到第 1 段」。
         const idx = message?.dogking_index?.[0];
-        if (node_has_panel(this) && Number.isFinite(idx)) {
-          this.dkAudio.setActive(Number(idx) - 1, false);
+        if (node_has_panel(this)) {
+          if (Number.isFinite(idx)) this.dkAudio.setActive(Number(idx) - 1, false);
+          this.dkAudio.updateExecInfo();
         }
         this.setDirtyCanvas?.(true, true);
       };
