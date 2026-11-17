@@ -34,6 +34,9 @@ import "./nodes/assets.js";
 // 提示词元数据嵌入 PNG：只需要一条状态条，没有面板
 import "./nodes/meta-stamp.js";
 
+// 数字人音频分段：整块面板（波形 + 切段 + 每段提示词）
+import "./nodes/audio-split.js";
+
 const comfyAPI = window.comfyAPI || {};
 const app = comfyAPI.app?.app;
 const api = comfyAPI.api?.api;

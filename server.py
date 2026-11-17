@@ -7,6 +7,7 @@ PromptVault 相关接口分两批：
 """
 
 import asyncio
+import os
 import sys
 import threading
 import time
@@ -17,16 +18,37 @@ _ROUTES = None
 # 同一时间只允许开一个文件选择框，避免连点弹出好几个
 _dialog_busy = threading.Lock()
 
+# 各用途的对话框过滤器与标题。都写成常量，避免每个 handler 里各拼一份
+# （\0 分隔的写法错一个字符就会让对话框里什么都不显示）。
+FILTER_PROMPT = (
+    "提示词文件\0*.txt;*.csv\0"
+    "文本文件 (*.txt)\0*.txt\0"
+    "CSV 文件 (*.csv)\0*.csv\0"
+    "所有文件 (*.*)\0*.*\0\0"
+)
+TITLE_PROMPT = "选择提示词文件（txt / csv）"
+
+FILTER_AUDIO = (
+    "音频文件\0*.wav;*.mp3;*.flac;*.ogg;*.m4a;*.aac\0"
+    "WAV (*.wav)\0*.wav\0"
+    "MP3 (*.mp3)\0*.mp3\0"
+    "所有文件 (*.*)\0*.*\0\0"
+)
+TITLE_AUDIO = "选择音频文件（wav / mp3 / flac / ogg / m4a）"
+
 
 # ---------------------------------------------------------------- 文件选择框
 
-def _ask_file_windows():
+def _ask_file_windows(filter_str=FILTER_PROMPT, title=TITLE_PROMPT, default_ext="txt"):
     """
     Windows 原生「打开文件」对话框。
 
     直接用 ctypes 调 comdlg32.GetOpenFileNameW —— ComfyUI 的 python_embeded
     是精简版，**不带 tkinter**，所以不能依赖它。
 
+    @param {str} filter_str `\0` 分隔的过滤器串（见 FILTER_PROMPT / FILTER_AUDIO）
+    @param {str} title 对话框标题
+    @param {str} default_ext 用户没打扩展名时自动补的后缀
     @returns {str} 选中的路径；用户取消或失败返回空串
     """
     import ctypes
@@ -76,18 +98,13 @@ def _ask_file_windows():
     ofn.hwndOwner = hwnd or None
 
     # 过滤器要用 \0 分隔，最后再来一个 \0 收尾
-    ofn.lpstrFilter = (
-        "提示词文件\0*.txt;*.csv\0"
-        "文本文件 (*.txt)\0*.txt\0"
-        "CSV 文件 (*.csv)\0*.csv\0"
-        "所有文件 (*.*)\0*.*\0\0"
-    )
+    ofn.lpstrFilter = filter_str
     # 注意：wintypes.LPWSTR 就是 ctypes.c_wchar_p，
     # cast 成 POINTER(c_wchar) 会得到 LP_c_wchar，赋值时报类型不兼容。
     ofn.lpstrFile = ctypes.cast(buf, ctypes.c_wchar_p)
     ofn.nMaxFile = 4096
-    ofn.lpstrTitle = "选择提示词文件（txt / csv）"
-    ofn.lpstrDefExt = "txt"
+    ofn.lpstrTitle = title
+    ofn.lpstrDefExt = default_ext or ""
     # OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR
     ofn.Flags = 0x00080000 | 0x00001000 | 0x00000800 | 0x00000008
 
@@ -98,7 +115,7 @@ def _ask_file_windows():
     return buf.value or ""
 
 
-def _ask_file_tk():
+def _ask_file_tk(filter_str=FILTER_PROMPT, title=TITLE_PROMPT):
     """非 Windows 平台的兜底：有 tkinter 就用它。"""
     try:
         import tkinter as tk
@@ -106,14 +123,20 @@ def _ask_file_tk():
     except Exception as e:
         raise RuntimeError(f"当前环境没有 tkinter：{e}")
 
+    # tkinter 要的是 ("说明", "*.wav *.mp3") 这种形式，和 Win32 的 \0 串不同。
+    # 从过滤器串里把 *.ext 抽出来，拼成一格。
+    patterns = []
+    for chunk in (filter_str or "").split("\0"):
+        chunk = chunk.strip()
+        if chunk.startswith("*.") or chunk.startswith("*."):
+            patterns.extend(p for p in chunk.split(";") if p)
+    filetypes = [("支持的文件", " ".join(dict.fromkeys(patterns)) or "*.*"), ("所有文件", "*.*")]
+
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)
     try:
-        return filedialog.askopenfilename(
-            title="选择提示词文件（txt / csv）",
-            filetypes=[("提示词文件", "*.txt *.csv"), ("所有文件", "*.*")],
-        ) or ""
+        return filedialog.askopenfilename(title=title, filetypes=filetypes) or ""
     finally:
         try:
             root.destroy()
@@ -258,6 +281,111 @@ async def select_folder(request):
         return web.json_response({"path": "", "error": str(e)})
     finally:
         _dialog_busy.release()
+
+
+async def select_audio(request):
+    """
+    弹系统原生文件选择框（只列音频），返回选中的路径。
+
+    和 select_file 只有过滤器不同 —— 共用 _dialog_busy，
+    所以同时点「选提示词」和「选音频」也只会弹一个框。
+    """
+    global _dialog_busy
+    if not _dialog_busy.acquire(blocking=False):
+        return web.json_response({"path": "", "error": "已经有一个选择框开着，先关掉它"})
+
+    try:
+        if sys.platform == "win32":
+            loop = asyncio.get_running_loop()
+            path = await loop.run_in_executor(
+                None, lambda: _ask_file_windows(FILTER_AUDIO, TITLE_AUDIO, "wav")
+            )
+        else:
+            path = _ask_file_tk(FILTER_AUDIO, TITLE_AUDIO)
+        return web.json_response({"path": path or ""})
+    except Exception as e:
+        return web.json_response({"path": "", "error": str(e)})
+    finally:
+        _dialog_busy.release()
+
+
+async def audio_peaks(request):
+    """
+    解码音频并返回画波形用的峰值数组。
+
+    body: {"path": "D:/a.wav", "buckets": 1200}
+    返回: {"ok": true, "duration": 32.08, "sampleRate": 44100,
+           "peaks": [0.0, 0.31, ...], "name": "a.wav", "path": "解析后的绝对路径"}
+          失败 {"ok": false, "error": "..."}
+
+    为什么由后端解码：浏览器解码各家格式行为不一致（mp3 时长有偏差、m4a 依赖系统编解码器），
+    而后端本来就要用同一套波形去切音频 —— **画的和切的是同一份数据**，
+    不会出现「波形上看着 5 秒、切出来 4.7 秒」。buckets 是画布取样点数，前端按宽度传。
+
+    解码放在线程池：一两分钟的音频读盘 + 计算要几百毫秒，同步跑会卡住
+    ComfyUI 的事件循环（进度条不动、界面假死）。
+    """
+    body = await _read_json_body(request)
+    path = str(body.get("path") or "")
+    try:
+        buckets = int(body.get("buckets") or 1200)
+    except (TypeError, ValueError):
+        buckets = 1200
+    buckets = max(64, min(buckets, 8000))
+
+    def _work():
+        from .audio_split import compute_peaks, resolve_audio_path
+
+        resolved = resolve_audio_path(path)
+        if not resolved:
+            return {"ok": False, "error": "找不到音频文件：%s" % (path or "(没填路径)")}
+        try:
+            duration, rate, peaks, raw = compute_peaks(resolved, buckets)
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": "这个音频读不出来：%s" % e}
+        return {
+            "ok": True,
+            "duration": duration,
+            "sampleRate": rate,
+            "peaks": peaks,
+            "rawPeak": raw,
+            "name": os.path.basename(resolved),
+            "path": resolved,
+        }
+
+    loop = asyncio.get_running_loop()
+    payload = await loop.run_in_executor(None, _work)
+    return web.json_response(payload)
+
+
+async def audio_file(request):
+    """
+    把本机音频文件当 HTTP 资源吐出去（面板试听用）。
+
+    query: path=<绝对路径 或 input 目录下的相对路径>
+    返回: 二进制（aiohttp 的 FileResponse 自带 Range 支持，拖进度条才正常）
+
+    为什么必须代理：面板里的 <audio> 拿不到本地文件路径，
+    `file://` 在浏览器里也被拦；上传到 input 的可以用 /view，
+    但从系统选择框选的是任意位置的绝对路径，只能由后端读出来转发。
+
+    安全：只放行音频扩展名。这个接口只服务本机用户，但限制一下能少一堆误用
+    （比如手滑把 .bat 的路径传进来）。
+    """
+    path = request.query.get("path", "")
+
+    from .audio_split import AUDIO_EXTENSIONS, resolve_audio_path
+
+    resolved = resolve_audio_path(path)
+    if not resolved:
+        return web.json_response({"ok": False, "error": "找不到音频文件：%s" % (path or "(空)")}, status=404)
+
+    ext = os.path.splitext(resolved)[1].lower()
+    if ext not in AUDIO_EXTENSIONS:
+        return web.json_response({"ok": False, "error": "只允许音频文件：%s" % ext}, status=403)
+
+    # FileResponse 会自己处理 Range / ETag / Content-Length
+    return web.FileResponse(resolved)
 
 
 async def list_images(request):
@@ -611,6 +739,10 @@ def register_routes():
 
     _ROUTES.post("/dogking-tools/select_file")(select_file)
     _ROUTES.post("/dogking-tools/select_folder")(select_folder)
+    # 音频分段节点用：选音频 + 波形峰值
+    _ROUTES.post("/dogking-tools/select_audio")(select_audio)
+    _ROUTES.post("/dogking-tools/audio_peaks")(audio_peaks)
+    _ROUTES.get("/dogking-tools/audio_file")(audio_file)
     _ROUTES.post("/dogking-tools/count")(count)
     _ROUTES.post("/dogking-tools/list_images")(list_images)
     _ROUTES.post("/dogking-tools/reset")(reset)

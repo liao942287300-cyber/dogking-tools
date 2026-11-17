@@ -63,6 +63,9 @@ _register_node_module("pv_asset_nodes", "PromptVault 资产图")
 # 提示词元数据嵌入 PNG（出图后反向喂回 PromptVault）
 _register_node_module("pv_meta_nodes", "提示词元数据嵌入")
 
+# 数字人音频分段（波形切段 + 每段提示词）
+_register_node_module("audio_split", "数字人音频分段")
+
 WEB_DIRECTORY = "./web"
 
 # 注册后端接口（文件选择 / 行数预览 / 重置计数 / PromptVault 代转）
