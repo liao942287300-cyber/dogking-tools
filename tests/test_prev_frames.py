@@ -338,6 +338,64 @@ def test_node_is_registered():
     assert _pf.NODE_DISPLAY_NAME_MAPPINGS["DogkingPrevSegmentFrames"].endswith("dogking-tools）")
 
 
+# ---------------------------------------------------------------- 无损末帧副本
+
+def test_tail_suffix_matches_concat():
+    """两个节点必须用同一个后缀，否则永远读不到无损副本。"""
+    assert _pf.TAIL_SUFFIX == _vc.TAIL_SUFFIX
+    assert _pf.tail_path_of("a/seg_0004.mp4") == _pf.tail_path_of("a/seg_0004.mp4")
+    assert _pf.tail_path_of("a/seg_0004.mp4").endswith("seg_0004_tail.mkv")
+
+
+def test_prefers_lossless_tail_over_mp4():
+    """
+    有 _tail.mkv 时优先读它。
+
+    mp4 是 crf14 有损的，续接拿它当引导帧等于每段多背一层压缩；
+    这里让两者内容不同，断言读到的是 tail 那份。
+    """
+    root = _isolate()
+    seg = os.path.join(root, _pf.CONCAT_ROOT, NAME, "seg_0001.mp4")
+    os.makedirs(os.path.dirname(seg))
+
+    # mp4 里是「接近黑」，tail 里是「接近白」—— 一眼能区分读到哪份
+    _vc.encode_segment(torch.cat([_gray(0)] * 6, dim=0), seg, FPS)
+    _vc.encode_tail_lossless(torch.cat([_gray(14)] * 8, dim=0), seg, FPS)
+
+    image, has_prev, source, count = _node().load_prev(段序号=2, 任务名=NAME)["result"]
+
+    assert has_prev is True
+    assert source.endswith("_tail.mkv")
+    assert count == 5
+    assert _mean(image, 0) > 0.7, "读到的还是 mp4（有损那份），没走无损副本"
+
+
+def test_falls_back_to_mp4_when_tail_missing():
+    """老片段没有 tail 文件时仍然能用，退回读 mp4。"""
+    root = _isolate()
+    _write_segment(root, count=8)
+
+    _, has_prev, source, count = _node().load_prev(段序号=2, 任务名=NAME)["result"]
+    assert has_prev is True
+    assert source.endswith("seg_0001.mp4")
+    assert count == 5
+
+
+def test_is_changed_tracks_tail_file():
+    """重跑上一段会重写 tail，签名必须跟着变。"""
+    root = _isolate()
+    seg = os.path.join(root, _pf.CONCAT_ROOT, NAME, "seg_0001.mp4")
+    os.makedirs(os.path.dirname(seg))
+    _vc.encode_segment(torch.cat([_gray(3)] * 6, dim=0), seg, FPS)
+
+    sig_mp4 = _pf.DogkingPrevSegmentFrames.IS_CHANGED(段序号=2, 任务名=NAME)
+    _vc.encode_tail_lossless(torch.cat([_gray(3)] * 6, dim=0), seg, FPS)
+    sig_tail = _pf.DogkingPrevSegmentFrames.IS_CHANGED(段序号=2, 任务名=NAME)
+
+    assert sig_mp4 != sig_tail, "出现了 tail 但签名没变，会一直读旧来源"
+    assert sig_tail.endswith("|0") or "|missing" not in sig_tail
+
+
 if __name__ == "__main__":
     import inspect
 

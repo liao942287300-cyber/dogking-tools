@@ -283,6 +283,73 @@ def test_audio_is_trimmed_to_video_length():
         assert 0.9 <= seconds <= 1.2, "音轨没按成片长度截断，实际 %.2fs" % seconds
 
 
+# ---------------------------------------------------------------- 无损末帧副本
+
+def test_segment_writes_lossless_tail():
+    """
+    每段落盘时顺手存一份末帧无损副本。
+
+    段 mp4 是 crf14 有损的，续接拿它解码当引导帧等于每段多背一层压缩。
+    ffv1 + bgr0 是数学无损：解码回来必须和写进去的像素完全一致。
+    """
+    import numpy as np
+
+    root = _isolate()
+    # 用随机噪声而不是纯色：纯色 crf14 也能无损，测不出差别
+    rng = np.random.default_rng(7)
+    noise = torch.from_numpy(rng.integers(0, 256, (10, 32, 32, 3), dtype=np.uint8)).float() / 255.0
+
+    node = _node()
+    node.concat(图像=noise, 段序号=1, 段数=3, fps=FPS, 任务名="无损")
+
+    seg = os.path.join(root, _vc.CONCAT_ROOT, "无损", "seg_0001.mp4")
+    tail = _vc.tail_path_of(seg)
+    assert os.path.isfile(tail), "没写无损末帧"
+
+    import av
+
+    with av.open(tail) as container:
+        back = np.stack([f.to_ndarray(format="rgb24") for f in container.decode(video=0)])
+    expect = (noise.numpy() * 255.0).round().astype(np.uint8)[-back.shape[0]:]
+    assert back.shape == expect.shape
+    assert np.abs(back.astype(int) - expect.astype(int)).max() == 0, "无损副本有像素误差"
+
+
+def test_tail_keeps_the_tail_not_the_head():
+    """末帧副本必须是「最后几帧」，不能从头截。"""
+    import numpy as np
+
+    root = _isolate()
+    span = 20
+    frames = torch.cat([torch.full((1, 16, 16, 3), i / span) for i in range(span)], dim=0)
+    _node().concat(图像=frames, 段序号=1, 段数=2, fps=FPS, 任务名="末帧")
+
+    seg = os.path.join(root, _vc.CONCAT_ROOT, "末帧", "seg_0001.mp4")
+    import av
+
+    with av.open(_vc.tail_path_of(seg)) as container:
+        back = np.stack([f.to_ndarray(format="rgb24") for f in container.decode(video=0)])
+    # 最后一帧灰度必须是 19/20，不是 0
+    assert abs(back[-1].mean() / 255.0 - 19 / span) < 0.02
+
+
+def test_single_mode_writes_no_tail():
+    """单段模式没有下一段要读，不该多存一份。"""
+    _isolate()
+    out = _node().concat(图像=_frames(4), 段序号=5, 段数=1, fps=FPS, 任务名="单段")
+    path = out["result"][0]
+    assert not os.path.exists(_vc.tail_path_of(path))
+
+
+def test_tail_is_not_counted_as_a_segment():
+    """_tail.mkv 不能混进片段清单，否则合并时会把它当第 N 段。"""
+    root = _isolate()
+    node = _node()
+    node.concat(图像=_frames(4), 段序号=1, 段数=3, fps=FPS, 任务名="计数")
+    work = os.path.join(root, _vc.CONCAT_ROOT, "计数")
+    assert len(_vc._existing_segments(work)) == 1
+
+
 if __name__ == "__main__":
     import inspect
 

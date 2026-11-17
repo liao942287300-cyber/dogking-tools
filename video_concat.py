@@ -53,6 +53,11 @@ FINAL_CRF = 16
 PRESET = "veryfast"
 # 单帧像素转 uint8 时裁到这个范围，避免 HDR / 越界值导致编码器报错
 PIX_MIN, PIX_MAX = 0.0, 1.0
+# 每段额外存一份「末 N 帧无损副本」，给「上一段末帧续接」读。
+# 段 mp4 是 crf14 有损的，续接再拿它解码当引导帧，等于每段多背一层压缩；
+# ffv1 + bgr0 存成 mkv 是数学无损（实测 RGB 往返误差 0），8 段链上少叠 8 层损失。
+TAIL_FRAMES = 39
+TAIL_SUFFIX = "_tail.mkv"
 
 
 def _output_dir():
@@ -101,6 +106,49 @@ def _frame_to_ndarray(frame):
     elif arr.shape[-1] > 3:
         arr = arr[:, :, :3]
     return (np.clip(arr, PIX_MIN, PIX_MAX) * 255.0).astype(np.uint8)
+
+
+def tail_path_of(seg_path):
+    """seg_0004.mp4 -> seg_0004_tail.mkv"""
+    base, _ext = os.path.splitext(seg_path)
+    return base + TAIL_SUFFIX
+
+
+def encode_tail_lossless(frames, seg_path, fps, count=TAIL_FRAMES):
+    """
+    把这一段最后 count 帧存成无损 mkv，返回写了几帧。
+
+    存不成功不算错误：这是「减少续接损失」的优化，不该让整段生成失败。
+    只在段数 > 1 时调用（单段模式没有下一段要读）。
+    """
+    import av
+
+    if frames is None or not hasattr(frames, "shape"):
+        return 0
+    if frames.ndim == 3:
+        frames = frames.unsqueeze(0)
+    total = int(frames.shape[0])
+    if total <= 0:
+        return 0
+    n = min(int(count), total)
+    part = frames[total - n:]
+    height, width = int(part.shape[1]), int(part.shape[2])
+    path = tail_path_of(seg_path)
+
+    container = av.open(path, "w")
+    try:
+        stream = container.add_stream("ffv1", rate=int(fps))
+        stream.width, stream.height = width, height
+        stream.pix_fmt = "bgr0"          # ffv1 只在这个像素格式下能开起来，且真无损
+        for i in range(n):
+            arr = _frame_to_ndarray(part[i])
+            for packet in stream.encode(av.VideoFrame.from_ndarray(arr, format="rgb24")):
+                container.mux(packet)
+        for packet in stream.encode():    # 同样必须 flush
+            container.mux(packet)
+    finally:
+        container.close()
+    return n
 
 
 def encode_segment(frames, path, fps):
@@ -410,14 +458,19 @@ class DogkingVideoConcat:
 
         seg_path = os.path.join(work_dir, "seg_%04d.mp4" % idx)
         frames = encode_segment(图像, seg_path, fps)
+        try:
+            saved_tail = encode_tail_lossless(图像, seg_path, fps)
+        except Exception as exc:  # noqa: BLE001
+            saved_tail = 0
+            print("[dogking-tools] 分段合并：无损末帧没存下来（%s），续接会退回读 mp4" % exc)
 
         parts = _existing_segments(work_dir)
         saved = len(parts)
 
         # 还没到最后一段：只落盘，提示还剩多少
         if idx < total:
-            status = "第 %d/%d 段已存 · %d 帧（%.2fs）· 待合并 %d 段" % (
-                idx, total, frames, frames / float(fps), total - saved
+            status = "第 %d/%d 段已存 · %d 帧（%.2fs）· 待合并 %d 段 · 末帧无损 %d" % (
+                idx, total, frames, frames / float(fps), total - saved, saved_tail
             )
             print("[dogking-tools] 分段合并：%s" % status)
             return {

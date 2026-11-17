@@ -47,6 +47,8 @@ CONCAT_ROOT = "dogking_concat"
 PLACEHOLDER_SIZE = 64
 # H3 引导片段只认 17k+5 帧（AddGuide 里那个 while guide_frames % 17 != 5）
 GUIDE_FRAME_STEPS = (5, 22, 39, 56, 73)
+# 「分段视频合并」额外存的末帧无损副本：seg_0004.mp4 -> seg_0004_tail.mkv
+TAIL_SUFFIX = "_tail.mkv"
 
 
 def _output_dir():
@@ -84,6 +86,31 @@ def segment_path(段序号, 任务名, 片段根目录=""):
         return ""
     name = _safe_name(任务名)
     return os.path.join(_parts_root(片段根目录), name, "seg_%04d.mp4" % prev)
+
+
+def tail_path_of(seg_path):
+    """seg_0004.mp4 -> seg_0004_tail.mkv（和「分段视频合并」的命名保持一致）"""
+    base, _ext = os.path.splitext(seg_path)
+    return base + TAIL_SUFFIX
+
+
+def resolve_segment(段序号, 任务名, 片段根目录=""):
+    """
+    决定读哪个文件。
+
+    优先读 `seg_000N_tail.mkv` —— 那是合并节点用 ffv1 存的无损末帧副本。
+    段 mp4 是 crf14 有损的，拿它当引导帧等于每段多背一层压缩，
+    8 段续接时高频细节（背景纹理最容易看出来）会一段比一段糊。
+
+    @returns {(str, str)} (路径, "无损" / "mp4")；没有上一段时 ("", "")
+    """
+    mp4 = segment_path(段序号, 任务名, 片段根目录)
+    if not mp4:
+        return "", ""
+    tail = tail_path_of(mp4)
+    if os.path.isfile(tail):
+        return tail, "无损"
+    return mp4, "mp4"
 
 
 def read_last_frames(path, count):
@@ -226,7 +253,7 @@ class DogkingPrevSegmentFrames:
     @classmethod
     def IS_CHANGED(cls, 段序号=1, 任务名="", 取末帧数=5, 片段根目录="", 缺段时="黑帧占位", 段数=0):
         # 片段被重写（重跑上一段）时要重算，否则会一直用旧的引导帧
-        path = segment_path(段序号, 任务名, 片段根目录)
+        path, _kind = resolve_segment(段序号, 任务名, 片段根目录)
         try:
             stat = os.stat(path)
             return "%s|%d|%d|%d" % (path, stat.st_mtime_ns, stat.st_size, int(段数))
@@ -249,7 +276,7 @@ class DogkingPrevSegmentFrames:
 
         # 先对齐到 17k+5：AddGuide 拿到不合法的批次会自己往下砍，且只用前几帧
         want = align_guide_frames(取末帧数)
-        path = segment_path(idx, 任务名, 片段根目录)
+        path, source_kind = resolve_segment(idx, 任务名, 片段根目录)
 
         # ---- 没有上一段：第 1 段、单段模式、或上一段没落盘
         if not path or not os.path.isfile(path):
@@ -286,9 +313,9 @@ class DogkingPrevSegmentFrames:
         if want != int(取末帧数):
             note = "（取末帧数 %d → 按 %d 帧，H3 只认 5/22/39…）" % (int(取末帧数), want)
         if got > 5:
-            note += "（%d 帧引导：记得把去重裁剪起点也改成 %d）" % (got, got)
-        status = "续接第 %d 段 · 取自 %s 末 %d 帧%s" % (
-            idx, os.path.basename(path), got, note
+            note += "· %d 帧引导（去重裁剪起点需同为 %d）" % (got, got)
+        status = "续接第 %d 段 · 取自 %s（%s）末 %d 帧%s" % (
+            idx, os.path.basename(path), source_kind, got, note
         )
         print("[dogking-tools] 上一段末帧：%s" % status)
         return {
