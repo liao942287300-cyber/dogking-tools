@@ -45,16 +45,22 @@ def _isolate(tag="pf"):
     return root
 
 
-def _gray(index, h=32, w=32):
-    """一帧纯灰，灰度值由 index 决定 —— 解码后靠均值就能认出是第几帧。"""
-    return torch.full((1, h, w, 3), index / 16.0, dtype=torch.float32)
+def _span(count):
+    """灰度分母：帧数超过 16 时要用更大的分母，否则 i/16 > 1 会被编码器裁成纯白。"""
+    return 16 if count <= 16 else count
+
+
+def _gray(index, span=16, h=32, w=32):
+    """一帧纯灰，灰度值 = index/span —— 解码后靠均值就能认出是第几帧。"""
+    return torch.full((1, h, w, 3), index / float(span), dtype=torch.float32)
 
 
 def _write_segment(root, count, idx=1, name=NAME):
-    """造一段 mp4，第 i 帧灰度 = i/16（i 从 0 开始）。"""
+    """造一段 mp4，第 i 帧灰度 = i/span（i 从 0 开始）。"""
     path = os.path.join(root, _pf.CONCAT_ROOT, name, "seg_%04d.mp4" % idx)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    frames = torch.cat([_gray(i) for i in range(count)], dim=0)
+    span = _span(count)
+    frames = torch.cat([_gray(i, span) for i in range(count)], dim=0)
     _vc.encode_segment(frames, path, FPS)
     return path
 
@@ -119,23 +125,24 @@ def test_reads_last_frames_of_previous_segment():
 
 
 def test_respects_frame_count():
+    """合法长度（22）要原样生效，不能被多砍。"""
     root = _isolate()
-    _write_segment(root, count=9)
+    _write_segment(root, count=30)
 
-    image, _, _, count = _node().load_prev(段序号=2, 任务名=NAME, 取末帧数=3)["result"]
-    assert count == 3
-    assert abs(_mean(image, -1) - 8 / 16.0) < 0.06     # 最后一张仍是第 9 帧
+    image, _, _, count = _node().load_prev(段序号=2, 任务名=NAME, 取末帧数=22)["result"]
+    assert count == 22
+    assert abs(_mean(image, -1) - 29 / 30.0) < 0.06     # 最后一张仍是第 30 帧
 
 
 def test_segment_shorter_than_requested():
-    """上一段只有 3 帧时给 3 帧，不补帧也不报错。"""
+    """上一段只有 3 帧时给 1 帧（AddGuide 对不足 5 帧只取第 1 张），不补帧也不报错。"""
     root = _isolate()
     _write_segment(root, count=3)
 
     image, has_prev, _, count = _node().load_prev(段序号=2, 任务名=NAME, 取末帧数=5)["result"]
     assert has_prev is True
-    assert count == 3
-    assert tuple(image.shape)[0] == 3
+    assert count == 1
+    assert tuple(image.shape)[0] == 1
 
 
 def test_image_dtype_and_range():
@@ -186,6 +193,58 @@ def test_batch_mode_still_guides():
     assert has_prev is True
     assert count == 5
     assert os.path.basename(source) == "seg_0004.mp4"
+
+
+# ---------------------------------------------------------------- 引导帧长度对齐
+
+def test_guide_frame_alignment():
+    """
+    H3 只认 17k+5。填 17 时 AddGuide 会砍到 5 并且只用前 5 帧（差十几帧画面），
+    所以节点必须自己先对齐，交出去的批次数永远是合法的。
+    """
+    cases = {1: 1, 4: 1, 5: 5, 6: 5, 17: 5, 21: 5, 22: 22, 25: 22, 38: 22, 39: 39, 56: 56, 73: 73}
+    for given, expect in cases.items():
+        assert _pf.align_guide_frames(given) == expect, "取末帧数 %d 应对齐到 %d" % (given, expect)
+
+
+def test_17_frames_falls_back_to_last_5_not_first_5():
+    """填 17 时必须取「最后 5 帧」，不能交给 AddGuide 去砍成前 5 帧。"""
+    root = _isolate()
+    _write_segment(root, count=40)      # 40 帧，灰度 i/40
+
+    out = _node().load_prev(段序号=2, 任务名=NAME, 取末帧数=17)
+    image, has_prev, _, count = out["result"]
+
+    assert has_prev is True
+    assert count == 5, "17 应该被对齐成 5 帧"
+    for k in range(5):                  # 最后 5 帧 = 第 35~39 帧
+        expect = (35 + k) / 40.0
+        assert abs(_mean(image, k) - expect) < 0.06, "第 %d 帧不对（%.3f vs %.3f）" % (
+            k, _mean(image, k), expect
+        )
+    assert "17 → 按 5 帧" in out["ui"]["dogking_status"][0]
+
+
+def test_22_frames_kept_whole():
+    """22 是合法长度，原样取 22 帧，别多砍。"""
+    root = _isolate()
+    _write_segment(root, count=40)
+
+    image, _, _, count = _node().load_prev(段序号=2, 任务名=NAME, 取末帧数=22)["result"]
+    assert count == 22
+    assert abs(_mean(image, 0) - 18 / 40.0) < 0.06      # 第 18 帧（40-22）
+    assert abs(_mean(image, -1) - 39 / 40.0) < 0.06
+
+
+def test_short_file_never_returns_illegal_length():
+    """片段只有 3 帧时返回 1 帧（AddGuide 对 <5 帧只取第 1 张）。"""
+    root = _isolate()
+    _write_segment(root, count=3)
+
+    image, has_prev, _, count = _node().load_prev(段序号=2, 任务名=NAME, 取末帧数=22)["result"]
+    assert has_prev is True
+    assert count == 1
+    assert abs(_mean(image, 0) - 2 / 16.0) < 0.06
 
 
 # ---------------------------------------------------------------- 缺段
@@ -251,7 +310,7 @@ def test_custom_parts_root():
         段序号=2, 任务名=NAME, 片段根目录=custom
     )["result"]
     assert has_prev is True
-    assert count == 3
+    assert count == 1
     assert source.startswith(custom)
 
 

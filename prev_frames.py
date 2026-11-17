@@ -45,6 +45,8 @@ import torch
 CONCAT_ROOT = "dogking_concat"
 # 占位帧尺寸：AddGuide 会自己缩放到目标分辨率，这里只要能读就行
 PLACEHOLDER_SIZE = 64
+# H3 引导片段只认 17k+5 帧（AddGuide 里那个 while guide_frames % 17 != 5）
+GUIDE_FRAME_STEPS = (5, 22, 39, 56, 73)
 
 
 def _output_dir():
@@ -110,6 +112,31 @@ def frames_to_image(frames):
     return torch.from_numpy(arr)
 
 
+def align_guide_frames(count):
+    """
+    把「取末帧数」对到 H3 认的长度上：只有 17k+5（5 / 22 / 39 / 56…）。
+
+    AddGuide 内部是 `while guide_frames % 17 != 5: guide_frames -= 1`，
+    也就是**向上不合法就往下砍**。所以填 17 不会按 17 用，而是被砍到 5 ——
+    而且它砍的是批次长度、用的是 `image[:5]`，即这 17 帧里的**前 5 帧**
+    （第 N-16 到第 N-12 帧），接缝会差十几帧，肉眼就是画面跳一下。
+
+    这里先对齐，保证传给 AddGuide 的批次数本身就是合法的，它不会再动刀。
+    向下取整而不是向上：本工作流的去重裁剪是固定的 5 帧（见 README），
+    真给 22 帧引导反而会多出 17 帧重复画面。
+
+    @returns {int} 1（不足 5 帧时 AddGuide 只取第 1 张）或 17k+5
+    """
+    n = int(count)
+    if n < 5:
+        return 1
+    best = 5
+    for valid in GUIDE_FRAME_STEPS:
+        if valid <= n:
+            best = valid
+    return best
+
+
 def _placeholder():
     """没有上一段时的占位：1 帧纯黑。AddGuide 会缩放到目标尺寸，不影响任何输出。"""
     return torch.zeros((1, PLACEHOLDER_SIZE, PLACEHOLDER_SIZE, 3), dtype=torch.float32)
@@ -162,8 +189,10 @@ class DogkingPrevSegmentFrames:
                     "tooltip": "必须和「分段视频合并」的任务名一致，否则找不到片段目录",
                 }),
                 "取末帧数": ("INT", {
-                    "default": 5, "min": 1, "max": 17, "step": 1,
-                    "tooltip": "H3 的引导片段只认 5、22、39…（17k+5）帧；一般填 5",
+                    "default": 5, "min": 1, "max": 73, "step": 1,
+                    "tooltip": "H3 的引导片段只认 5、22、39、56…（17k+5）帧。"
+                               "填别的会自动向下对齐（填 17 实际按 5 帧用）。"
+                               "一般填 5 —— 加长引导还要同时改去重裁剪长度，见 README",
                 }),
                 "片段根目录": ("STRING", {
                     "default": "",
@@ -218,6 +247,8 @@ class DogkingPrevSegmentFrames:
                 "result": (_placeholder(), False, "", 1),
             }
 
+        # 先对齐到 17k+5：AddGuide 拿到不合法的批次会自己往下砍，且只用前几帧
+        want = align_guide_frames(取末帧数)
         path = segment_path(idx, 任务名, 片段根目录)
 
         # ---- 没有上一段：第 1 段、单段模式、或上一段没落盘
@@ -238,17 +269,26 @@ class DogkingPrevSegmentFrames:
                 "result": (_placeholder(), False, "", 1),
             }
 
-        # ---- 有上一段：只留末尾 count 帧
-        frames = read_last_frames(path, count)[:count]
+        # ---- 有上一段：只留末尾 want 帧
+        frames = read_last_frames(path, want)
         if not frames:
             raise ValueError(
                 "上一段 %s 解码出来是 0 帧（文件可能损坏或还没写完）"
                 % os.path.basename(path)
             )
+        # 片段本身不足 want 帧时，按它实际有的帧数再对一次，别交不合法长度出去
+        usable = align_guide_frames(len(frames))
+        frames = frames[-usable:] if usable < len(frames) else frames
+
         image = frames_to_image(frames)
         got = int(image.shape[0])
-        status = "续接第 %d 段 · 取自 %s 末 %d 帧" % (
-            idx, os.path.basename(path), got
+        note = ""
+        if want != int(取末帧数):
+            note = "（取末帧数 %d → 按 %d 帧，H3 只认 5/22/39…）" % (int(取末帧数), want)
+        if got > 5:
+            note += "（%d 帧引导：记得把去重裁剪起点也改成 %d）" % (got, got)
+        status = "续接第 %d 段 · 取自 %s 末 %d 帧%s" % (
+            idx, os.path.basename(path), got, note
         )
         print("[dogking-tools] 上一段末帧：%s" % status)
         return {
