@@ -228,6 +228,33 @@ def test_legacy_switch_names_still_work():
     assert os.path.isfile(os.path.join(work, "seg_0001.mp4")), "旧名字没生效"
 
 
+def test_final_result_carries_video_preview():
+    """
+    成片要能在节点里直接播，不用另接「Video Combine」。
+
+    用的是官方 SaveVideo 那套约定：`ui.images` + `animated: true`，
+    前端看到 .mp4 + animated 就渲染 <video>。少一个字段就退化成「找不到图片」。
+    """
+    _isolate()
+    node = _node()
+    node.concat(图像=_frames(3), 段序号=1, 段数=2, fps=FPS, 任务名="预览")
+    out = node.concat(图像=_frames(3), 段序号=2, 段数=2, fps=FPS, 任务名="预览")
+
+    ui = out["ui"]
+    assert ui["animated"][0] is True
+    entry = ui["images"][0]
+    assert entry["filename"].endswith(".mp4")
+    assert entry["type"] == "output"
+    assert entry["subfolder"] == ""
+
+
+def test_middle_segment_has_no_preview():
+    """中间段还没成片，别塞一个空预览占着节点。"""
+    _isolate()
+    out = _node().concat(图像=_frames(3), 段序号=1, 段数=3, fps=FPS, 任务名="无预览")
+    assert "images" not in out["ui"]
+
+
 def test_audio_is_trimmed_to_video_length():
     """
     音频比成片长时按成片截断。

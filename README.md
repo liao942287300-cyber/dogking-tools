@@ -733,6 +733,9 @@ mp4 这类容器里的音轨也走 PyAV，能直接抽出来。
 | 输出口 | 类型 | 说明 |
 | --- | --- | --- |
 | **视频路径** | STRING | 没合并时是当前片段路径，合并后是完整片路径（绝对路径，可直接播） |
+
+合并完成后**节点上会直接显示成片预览**（自动循环播放，和官方 Save Video 一样），
+不用另接一个播放节点。中间段不显示，因为还没成片。
 | **完成** | BOOLEAN | 最后一段跑完为 true，可以接条件节点触发后续 |
 | **总帧数** | INT | 这一段 / 整条的帧数 |
 
@@ -754,7 +757,7 @@ mp4 这类容器里的音轨也走 PyAV，能直接抽出来。
 
 ## 跑测试
 
-### Python 测试（174 条）
+### Python 测试（176 条）
 
 ```bash
 # 全部测试（推荐）
@@ -766,7 +769,7 @@ python tests/test_pv_store.py        # 32 条
 python tests/test_pv_asset_nodes.py  # 29 条
 python tests/test_pv_meta.py         # 25 条
 python tests/test_audio_split.py     # 38 条
-python tests/test_video_concat.py    # 13 条
+python tests/test_video_concat.py    # 15 条
 python tests/test_pv_client.py       # 53 条断言（脚本式）
 ```
 
@@ -777,7 +780,7 @@ python tests/test_pv_client.py       # 53 条断言（脚本式）
 | `test_pv_asset_nodes.py` | 29 | 节点 3、4 的**每个 return 点**（按出口组织，不按功能点） |
 | `test_pv_meta.py` | 25 | 参数扫描（含「全图没有 steps」的 sigmas 工作流）/ 参数行不得污染负向词 / iTXt 中文往返 |
 | `test_audio_split.py` | 38 | 分段表容错 / 秒→采样点换算 / 游标推进与归零 / 改切点重置而改提示词不重置 / 提示词覆盖优先级 / 波形峰值归一化 / 三级解码链（不碰 torchaudio） |
-| `test_video_concat.py` | 13 | 编码不丢尾帧（flush）/ 累积顺序 / 缺段报错不出半成品 / 首段清旧片段 / 单段模式不碰批量目录 / 尺寸不一致 / AAC 音轨写入 |
+| `test_video_concat.py` | 15 | 编码不丢尾帧（flush）/ 累积顺序 / 缺段报错不出半成品 / 首段清旧片段 / 单段模式不碰批量目录 / 尺寸不一致 / AAC 音轨写入 |
 | `test_pv_client.py` | 1（包装） | HTTP 层的 `includeChildren` 等不变量（53 条 `check()` 在 import 时跑完，末尾用一条包装交给 pytest） |
 
 > ⚠️ **`tests/conftest.py` 不是装饰品，别删。**

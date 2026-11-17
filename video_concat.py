@@ -289,6 +289,26 @@ def _fmt_seconds(frames, fps):
     return "%.2fs" % (frames / float(fps))
 
 
+def _preview_ui(path, out_root):
+    """
+    让节点自己把成片显示出来（和「Video Combine」那样能直接播）。
+
+    用的是官方 `SaveVideo` 同一套约定：`ui.images` 里放 `{filename, subfolder, type}`
+    再加 `animated: true`，前端看到 .mp4 + animated 就渲染 `<video>`。
+    自己拼 `ui.gifs` 是 VHS 的私有格式，只在他们那个前端补丁里生效，这里不用。
+    """
+    rel = os.path.relpath(path, out_root).replace("\\", "/")
+    subfolder = os.path.dirname(rel)
+    return {
+        "images": [{
+            "filename": os.path.basename(path),
+            "subfolder": subfolder,
+            "type": "output",
+        }],
+        "animated": (True,),
+    }
+
+
 class DogkingVideoConcat:
     """
     分段视频合并：每段落盘，最后一段自动拼成一条完整视频。
@@ -374,6 +394,7 @@ class DogkingVideoConcat:
                 "ui": {
                     "dogking_status": [status],
                     "dogking_badge": ["单段 · %d 帧" % frames],
+                    **_preview_ui(final_path, out_root),
                 },
                 "result": (final_path, True, int(frames)),
             }
@@ -438,6 +459,7 @@ class DogkingVideoConcat:
             "ui": {
                 "dogking_status": [status],
                 "dogking_badge": ["完成 %d 帧" % total_frames],
+                **_preview_ui(final_path, out_root),
             },
             "result": (final_path, True, int(total_frames)),
         }
