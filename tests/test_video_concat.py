@@ -136,7 +136,7 @@ def test_keep_parts_when_asked():
     node = _node()
     node.concat(图像=_frames(3), 段序号=1, 段数=2, fps=FPS, 任务名="留片段")
     node.concat(图像=_frames(3), 段序号=2, 段数=2, fps=FPS, 任务名="留片段",
-                保留片段=True)
+                合并后保留片段=True)
     work = os.path.join(root, _vc.CONCAT_ROOT, "留片段")
     assert os.path.isfile(os.path.join(work, "seg_0001.mp4"))
     assert os.path.isfile(os.path.join(work, "seg_0002.mp4"))
@@ -208,6 +208,24 @@ def test_audio_track_is_muxed():
     with av.open(path) as container:
         assert container.streams.audio, "音轨没写进去"
         assert int(container.streams.audio[0].codec_context.sample_rate) == rate
+
+
+def test_legacy_switch_names_still_work():
+    """
+    两个开关改过名（清空旧片段 → 开始时清空旧片段，保留片段 → 合并后保留片段）。
+
+    直接提交的 API 格式工作流会把旧 key 原样传进来 —— 不接住就 TypeError，
+    老工作流一跑就红。这里断言旧名字仍然生效。
+    """
+    root = _isolate()
+    node = _node()
+    node.concat(图像=_frames(4), 段序号=1, 段数=2, fps=FPS, 任务名="旧名")
+    out = node.concat(图像=_frames(4), 段序号=2, 段数=2, fps=FPS, 任务名="旧名",
+                      保留片段=True)          # 旧名字，应映射到「合并后保留片段」
+
+    assert out["result"][1] is True
+    work = os.path.join(root, _vc.CONCAT_ROOT, "旧名")
+    assert os.path.isfile(os.path.join(work, "seg_0001.mp4")), "旧名字没生效"
 
 
 def test_audio_is_trimmed_to_video_length():

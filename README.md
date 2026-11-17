@@ -722,8 +722,11 @@ mp4 这类容器里的音轨也走 PyAV，能直接抽出来。
 | **fps** | **必须填生成时的真实帧率**（24 就填 24）。填错的话音轨时长对不上，表现为越播越偏 |
 | **任务名** | 同一个任务名共用一套临时片段；换项目时改个名字即可 |
 | **音频**（可选） | **接音频分段的「选区音频」口** —— 那一口就是整条选区（含你框的头尾裁剪），不用另外去接原音频。合并时压成 AAC 写进 mp4；不接就是无声视频 |
-| **清空旧片段**（默认开） | 段 1 执行时清掉同名任务的旧片段，避免上一轮残留混进来 |
-| **保留片段**（默认关） | 合并后留着临时片段；排查接缝问题时会用到 |
+| **开始时清空旧片段**（默认开） | **段 1 开始前**清掉同名任务的旧片段，避免上一轮残留混进来 |
+| **合并后保留片段**（默认关） | **最后一段合并完成后**留着这一轮的片段；排查接缝问题时会用到 |
+
+> 这两个开关管的是**不同时间点**（开头 / 结尾），不是互斥关系，两个都开也正常：
+> 开跑前清掉上一轮的，跑完留着这一轮的。
 
 ### 输出
 
@@ -751,7 +754,7 @@ mp4 这类容器里的音轨也走 PyAV，能直接抽出来。
 
 ## 跑测试
 
-### Python 测试（173 条）
+### Python 测试（174 条）
 
 ```bash
 # 全部测试（推荐）
@@ -763,7 +766,7 @@ python tests/test_pv_store.py        # 32 条
 python tests/test_pv_asset_nodes.py  # 29 条
 python tests/test_pv_meta.py         # 25 条
 python tests/test_audio_split.py     # 38 条
-python tests/test_video_concat.py    # 12 条
+python tests/test_video_concat.py    # 13 条
 python tests/test_pv_client.py       # 53 条断言（脚本式）
 ```
 
@@ -774,7 +777,7 @@ python tests/test_pv_client.py       # 53 条断言（脚本式）
 | `test_pv_asset_nodes.py` | 29 | 节点 3、4 的**每个 return 点**（按出口组织，不按功能点） |
 | `test_pv_meta.py` | 25 | 参数扫描（含「全图没有 steps」的 sigmas 工作流）/ 参数行不得污染负向词 / iTXt 中文往返 |
 | `test_audio_split.py` | 38 | 分段表容错 / 秒→采样点换算 / 游标推进与归零 / 改切点重置而改提示词不重置 / 提示词覆盖优先级 / 波形峰值归一化 / 三级解码链（不碰 torchaudio） |
-| `test_video_concat.py` | 12 | 编码不丢尾帧（flush）/ 累积顺序 / 缺段报错不出半成品 / 首段清旧片段 / 单段模式不碰批量目录 / 尺寸不一致 / AAC 音轨写入 |
+| `test_video_concat.py` | 13 | 编码不丢尾帧（flush）/ 累积顺序 / 缺段报错不出半成品 / 首段清旧片段 / 单段模式不碰批量目录 / 尺寸不一致 / AAC 音轨写入 |
 | `test_pv_client.py` | 1（包装） | HTTP 层的 `includeChildren` 等不变量（53 条 `check()` 在 import 时跑完，末尾用一条包装交给 pytest） |
 
 > ⚠️ **`tests/conftest.py` 不是装饰品，别删。**

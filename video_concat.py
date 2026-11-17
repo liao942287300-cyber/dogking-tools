@@ -324,13 +324,14 @@ class DogkingVideoConcat:
                 "音频": ("AUDIO", {
                     "tooltip": "整条音频（不是某一段）。合并时一起压进 mp4；不接就是无声视频",
                 }),
-                "清空旧片段": ("BOOLEAN", {
+                "开始时清空旧片段": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "段 1 执行时清掉同名任务的旧片段，避免上一轮的残留混进来",
+                    "tooltip": "段 1 执行前清掉同名任务的旧片段，避免上一轮的残留混进来。"
+                               "和下面的「合并后保留片段」不冲突：那个管结尾，这个管开头",
                 }),
-                "保留片段": ("BOOLEAN", {
+                "合并后保留片段": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "合并完成后留着临时片段（排查接缝问题时会用到）",
+                    "tooltip": "最后一段合并完成后，留着这一轮的临时片段（排查接缝问题时会用到）",
                 }),
             },
         }
@@ -346,7 +347,14 @@ class DogkingVideoConcat:
     )
 
     def concat(self, 图像, 段序号, 段数, fps, 任务名,
-               音频=None, 清空旧片段=True, 保留片段=False):
+               音频=None, 开始时清空旧片段=True, 合并后保留片段=False, **kwargs):
+        # 兼容旧工作流：这两个开关原来叫「清空旧片段」/「保留片段」。
+        # UI 重开会按新名字重建 widget，但直接提交的 API 格式工作流会把旧 key 传进来，
+        # 不认就 TypeError —— 这里接住并映射，老工作流不用改动。
+        if "清空旧片段" in kwargs:
+            开始时清空旧片段 = kwargs.pop("清空旧片段")
+        if "保留片段" in kwargs:
+            合并后保留片段 = kwargs.pop("保留片段")
         idx = max(1, int(段序号))
         total = max(1, int(段数))
         fps = max(1, int(fps))
@@ -374,7 +382,7 @@ class DogkingVideoConcat:
         os.makedirs(work_dir, exist_ok=True)
 
         # ---- 段 1：新一轮开始，清掉同名的旧片段
-        if idx == 1 and 清空旧片段:
+        if idx == 1 and 开始时清空旧片段:
             removed = _clear_dir(work_dir)
             if removed:
                 print("[dogking-tools] 分段合并：清掉 %d 个旧片段" % removed)
@@ -414,7 +422,7 @@ class DogkingVideoConcat:
         final_path = os.path.join(out_root, "%s_%s.mp4" % (name, stamp))
         total_frames = concat_segments(parts, final_path, fps, 音频)
 
-        if not 保留片段:
+        if not 合并后保留片段:
             _clear_dir(work_dir)
             try:
                 os.rmdir(work_dir)          # 目录空了才删得掉，非空会抛，忽略即可
