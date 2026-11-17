@@ -700,6 +700,8 @@ class AudioSplitPanel {
     this.segments = clipped;
     this.normalizeSegments();
     this.active = Math.max(0, Math.min(this.active, this.segments.length - 1));
+    // 段被裁少了，原来的「当前段」可能已经越界 —— 写回去，别留一个指向不存在段号的 widget
+    this.syncActiveWidget();
   }
 
   /** 选区变了以后按新窗口重排分段：裁掉外面的、贴上两端的 */
@@ -903,6 +905,7 @@ class AudioSplitPanel {
     if (last && to - last.end > 1e-6 && to - last.end <= MIN_GAP) last.end = to;
     this.segments = segments;
     this.active = 0;
+    this.syncActiveWidget();
     this.commit();
     this.renderList();
     this.draw();
@@ -912,10 +915,22 @@ class AudioSplitPanel {
     // 只清分段，选区保留 —— 用户裁好的头尾不该被「清空分段」一起抹掉
     this.segments = [];
     this.active = 0;
+    this.syncActiveWidget();
     this.updateRangeLabel();
     this.commit();
     this.renderList();
     this.draw();
+  }
+
+  /**
+   * 把面板选中的段写回「当前段」widget。
+   *
+   * 后端单段模式只读这个 widget，面板上高亮哪一段跟它无关 —— 两边一旦不同步，
+   * 就会出现「面板亮第 1 段、实际输出第 8 段」这种看起来像 bug、其实是数据陈旧的情况。
+   * 所有改动 active 的地方（等分 / 删段 / 改选区 / 换音频）都要过这里。
+   */
+  syncActiveWidget() {
+    this.writeWidget("当前段", this.active + 1);
   }
 
   /** 删掉某段：把它并进前一段（第一段则并进后一段），比"留个洞"更好用 */
@@ -932,6 +947,7 @@ class AudioSplitPanel {
     }
     this.segments.splice(index, 1);
     this.active = Math.min(this.active, this.segments.length - 1);
+    this.syncActiveWidget();
     this.commit();
     this.renderList();
     this.draw();
@@ -1003,6 +1019,7 @@ class AudioSplitPanel {
           ? [{ start: 0, end: this.duration, prompt: this.segments[0]?.prompt || "" }]
           : [];
         this.active = 0;
+        this.syncActiveWidget();
         this.commit();
       } else {
         // 同一音频重新载入：只把超出新时长的段裁掉
@@ -1624,7 +1641,13 @@ class AudioSplitPanel {
     }
     this.normalizeSegments();
     this.updateRangeLabel();
+    // 选中段必须以「当前段」widget 为准 —— 那个值才是执行时后端真正用的。
+    // 以前这里直接沿用内存里的 this.active（初始 0），于是打开工作流后面板亮着
+    // 第 1 段、实际却输出第 8 段，看着就像「选哪段都一样」。
+    const cur = Math.round(Number(this.readWidget("当前段")));
+    if (Number.isFinite(cur) && cur >= 1) this.active = cur - 1;
     this.active = Math.max(0, Math.min(this.active, this.segments.length - 1));
+    this.syncActiveWidget();   // widget 存了个越界段号（改过切点/选区）就顺手夹回来
     this.updatePlayButton();
     this.renderList();
     this.resize();
