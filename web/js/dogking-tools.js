@@ -37,6 +37,9 @@ import "./nodes/meta-stamp.js";
 // 数字人音频分段：整块面板（波形 + 切段 + 每段提示词）
 import "./nodes/audio-split.js";
 
+// 分段视频合并：只有标题栏 badge（3/8 已存 → 完成）
+import "./nodes/video-concat.js";
+
 const comfyAPI = window.comfyAPI || {};
 const app = comfyAPI.app?.app;
 const api = comfyAPI.api?.api;

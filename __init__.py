@@ -66,6 +66,9 @@ _register_node_module("pv_meta_nodes", "提示词元数据嵌入")
 # 数字人音频分段（波形切段 + 每段提示词）
 _register_node_module("audio_split", "数字人音频分段")
 
+# 分段视频合并（每段落盘，最后一段自动拼成一条）
+_register_node_module("video_concat", "分段视频合并")
+
 WEB_DIRECTORY = "./web"
 
 # 注册后端接口（文件选择 / 行数预览 / 重置计数 / PromptVault 代转）
