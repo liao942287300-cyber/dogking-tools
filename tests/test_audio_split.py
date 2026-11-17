@@ -226,6 +226,23 @@ def test_node_single_mode_clamps_cursor():
     assert _run(node, segs, mode="单段", cur=99)["result"][2] == 2
 
 
+def test_node_out_total_reports_run_size():
+    """
+    「段数」口报的是**这次产出几段**，不是切了几段：
+    单段模式恒为 1（一次只吐一段），顺序模式才是总段数。
+    拿它当循环次数 / 批量上限时，单段不该被「切了 8 段」牵连。
+    """
+    node = _av.DogkingAudioSplit()
+    segs = _segments((0, 1, ""), (1, 2, ""), (2, 3, ""))
+
+    for cur in (1, 2, 3):
+        out = _run(node, segs, mode="单段", cur=cur)
+        assert out["result"][3] == 1, "单段模式的段数必须是 1"
+        assert out["result"][2] == cur, "段序号仍报真实段号"
+
+    assert _run(node, segs, mode="顺序", cur=1)["result"][3] == 3
+
+
 def test_node_cut_change_resets_cursor():
     node = _av.DogkingAudioSplit()
     segs_a = _segments((0, 1, ""), (1, 2, ""), (2, 3, ""))
