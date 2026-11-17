@@ -69,6 +69,9 @@ _register_node_module("audio_split", "数字人音频分段")
 # 分段视频合并（每段落盘，最后一段自动拼成一条）
 _register_node_module("video_concat", "分段视频合并")
 
+# 上一段末帧续接（读上一段成片末 N 帧当 AddGuide 引导图）
+_register_node_module("prev_frames", "上一段末帧续接")
+
 WEB_DIRECTORY = "./web"
 
 # 注册后端接口（文件选择 / 行数预览 / 重置计数 / PromptVault 代转）
