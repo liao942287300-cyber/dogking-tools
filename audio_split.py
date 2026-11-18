@@ -453,6 +453,13 @@ class DogkingAudioSplit:
                     "multiline": False,
                     "tooltip": "本机音频文件；接了「音频」输入口时以输入口为准",
                 }),
+                "前置重叠帧": ("INT", {
+                    "default": 0, "min": 0, "max": 96, "step": 1,
+                    "tooltip": "本段音频往前多带几帧（24fps）上一段的尾巴，给「上一段末帧续接」的"
+                               "引导帧当时间基准。必须与画面「去重裁剪起点」完全一致，否则每段"
+                               "音画错位、口型越跑越快。默认 0 = 不前置（不影响其它工作流）；"
+                               "接了续接节点时填成和裁剪起点一样（22 帧方案 → 22）",
+                }),
             },
             "optional": {
                 "音频": ("AUDIO", {
@@ -483,7 +490,7 @@ class DogkingAudioSplit:
         return float("NaN")
 
     def split(self, 分段数据, 全局提示词, 输出模式, 当前段, 自动连续, 文件路径,
-              音频=None, unique_id=None):
+              前置重叠帧=0, 音频=None, unique_id=None):
         key = str(unique_id or "0")
 
         segments = parse_segments(分段数据)
@@ -518,13 +525,27 @@ class DogkingAudioSplit:
             out_total = total
 
         segment = segments[index]
-        piece = slice_audio(audio, segment["start"], segment["end"])
-        prompt = resolve_prompt(segment, 全局提示词)
-        duration = audio_duration(piece)
 
-        status = "第 %d/%d 段（%.2f–%.2f 秒）%s" % (
+        # 段 2 以后把音频往前多带 `前置重叠帧` 帧（上一段的尾巴）。
+        #
+        # 为什么必须这么做：画面那头「上一段末帧续接」把上一段的最后 N 帧钉在输出
+        # 第 0..N-1 帧上，模型从第 N 帧才回到本段音频的起点。生成完再裁掉这 N 帧，
+        # 留下来的画面就比音频整体超前 N 帧 —— 每段累加，第 2 段起口型就"快一点"。
+        # 音频分支是 SetLatentNoiseMask(0) 锁死的原声，时间轴以它为准，所以只能让
+        # 音频也把这段前导带进来，两者才对得上。
+        #
+        # 「本段时长」仍然只报真正的段长（end - start），不能把前导算进去：
+        # 下游的帧长算式和裁剪长度都基于它，多算了会连锁出错。
+        overlap = max(0, int(前置重叠帧))
+        lead = overlap / 24.0 if index > 0 else 0.0
+        piece = slice_audio(audio, max(0.0, segment["start"] - lead), segment["end"])
+        prompt = resolve_prompt(segment, 全局提示词)
+        duration = max(0.0, float(segment["end"]) - float(segment["start"]))
+
+        status = "第 %d/%d 段（%.2f–%.2f 秒）%s%s" % (
             index + 1, total, segment["start"], segment["end"],
             " · 独立提示词" if segment["prompt"] else "",
+            (" · 音频前置 %d 帧" % overlap) if lead > 0 else "",
         )
         print("[dogking-tools] 音频分段：%s" % status)
 

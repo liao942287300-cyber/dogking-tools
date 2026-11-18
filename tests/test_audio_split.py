@@ -523,6 +523,90 @@ def test_load_waveform_reports_all_failures():
 
 # ---------------------------------------------------------------- 直接运行
 
+# ---------------------------------------------------------------- 前置重叠（音画对齐）
+
+def _ramp_audio(seconds=6.0, rate=8000):
+    """单调上升的波形：第 t 秒的值就是 t，能直接反推切的是哪一段。"""
+    import torch
+    n = int(seconds * rate)
+    t = torch.linspace(0, seconds, n, dtype=torch.float32)
+    return {"waveform": t.view(1, 1, -1), "sample_rate": rate}
+
+
+def _run_at(node, segments, cur, lead):
+    """单段模式指定段号：不碰 state.json 里的顺序游标，结果可重复。"""
+    return node.split(
+        分段数据=segments, 全局提示词="", 输出模式="单段", 当前段=cur,
+        自动连续=False, 文件路径="", 前置重叠帧=lead,
+        音频=_ramp_audio(), unique_id="lead-test",
+    )
+
+
+def test_first_segment_has_no_pre_roll():
+    """第 1 段没有上一段，不能凭空往前多带，否则开头会多出 0.92 秒无画面。"""
+    node = _av.DogkingAudioSplit()
+    segs = _segments((1, 3, ""), (3, 5, ""))
+    out = _run_at(node, segs, 1, 22)
+    audio = out["result"][0]
+    assert _av.audio_duration(audio) == pytest.approx(2.0, abs=1e-3)
+    assert float(audio["waveform"].flatten()[0]) == pytest.approx(1.0, abs=2e-3)
+
+
+def test_second_segment_carries_pre_roll():
+    """
+    段 2 的音频必须从「段起点 − 22 帧」开始：那 22 帧正是被钉在画面第 0~21 帧的
+    上一段尾巴。音频不跟上的话，裁完画面就比声音超前，口型每段越跑越快。
+    """
+    node = _av.DogkingAudioSplit()
+    segs = _segments((1, 3, ""), (3, 5, ""))
+    out = _run_at(node, segs, 2, 22)
+
+    expect = 22 / 24.0
+    audio = out["result"][0]
+    assert _av.audio_duration(audio) == pytest.approx(2.0 + expect, abs=2e-3)
+    # 第一个采样应该落在 3.0 − 22/24 秒
+    assert float(audio["waveform"].flatten()[0]) == pytest.approx(3.0 - expect, abs=3e-3)
+
+
+def test_pre_roll_does_not_change_segment_duration():
+    """
+    「本段时长」必须还是真实段长。下游拿它算帧长（a*24）和裁剪长度，
+    把前导算进去会让帧长多 22 帧，裁剪点跟着错。
+    """
+    node = _av.DogkingAudioSplit()
+    segs = _segments((1, 3, ""), (3, 5, ""))
+    out = _run_at(node, segs, 2, 22)
+    assert out["result"][4] == pytest.approx(2.0, abs=1e-6)
+
+
+def test_pre_roll_zero_keeps_old_behaviour():
+    """填 0 = 老行为，不做任何前导。"""
+    node = _av.DogkingAudioSplit()
+    segs = _segments((1, 3, ""), (3, 5, ""))
+    out = _run_at(node, segs, 2, 0)
+    audio = out["result"][0]
+    assert _av.audio_duration(audio) == pytest.approx(2.0, abs=1e-3)
+    assert float(audio["waveform"].flatten()[0]) == pytest.approx(3.0, abs=2e-3)
+
+
+def test_pre_roll_clamps_at_zero():
+    """段起点比前导还短时从 0 开始，不能负索引（也不能报错）。"""
+    node = _av.DogkingAudioSplit()
+    segs = _segments((0.0, 0.3, ""), (0.5, 2.5, ""))   # 段 2 起点 0.5s < 前导 0.917s
+    out = _run_at(node, segs, 2, 22)
+    audio = out["result"][0]
+    assert _av.audio_duration(audio) == pytest.approx(2.5, abs=2e-3)   # 从 0 到 2.5
+    assert float(audio["waveform"].flatten()[0]) == pytest.approx(0.0, abs=2e-3)
+
+
+def test_pre_roll_status_mentions_it():
+    """状态行要写出来，否则用户没法判断到底前置了还是没前置。"""
+    node = _av.DogkingAudioSplit()
+    segs = _segments((1, 3, ""), (3, 5, ""))
+    assert "音频前置 22 帧" in _run_at(node, segs, 2, 22)["ui"]["dogking_status"][0]
+    assert "音频前置" not in _run_at(node, segs, 1, 22)["ui"]["dogking_status"][0]
+
+
 if __name__ == "__main__":
     import inspect
 
