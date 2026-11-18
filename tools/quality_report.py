@@ -26,6 +26,9 @@ import sys
 
 import numpy as np
 
+# 开头这几帧是模型的收敛过程（实测 25.2 平滑降到 17.7），不参与基线统计
+WARMUP_FRAMES = 12
+
 
 def _detail(gray):
     """中央区域的拉普拉斯标准差：越高越锐。避开边缘，只测画面主体。"""
@@ -78,26 +81,47 @@ def report(path):
         print("%-8s %8.2f %7.3f %7.3f %7.3f %7.2f %7.2f" % (
             "#%d" % i, s["亮度"], s["G/R"], s["B/R"], s["饱和"], s["锐度"], s["块比"]))
 
+    # 基线要用全片算，且去掉开头收敛段。
+    # 只拿「首帧 vs 末帧」比会得出「掉 29%」的假结论 —— 实测开头 12 帧是
+    # 25.2 平滑降到 17.7，之后 470 帧稳定在 18.7±1.3，那是收敛不是衰减。
+    sharp_all = np.array([_detail(f.astype(np.float32).mean(2)) for f in frames])
+    warm = min(WARMUP_FRAMES, max(1, total // 10))
+    body = sharp_all[warm:] if total > warm + 1 else sharp_all
+    base, spread = float(body.mean()), float(body.std())
+    rel_spread = spread / max(base, 1e-6) * 100
+
     first, last = stats[0][1], stats[-1][1]
     g_drift = (last["G/R"] - first["G/R"]) / first["G/R"] * 100
-    sharp_drop = (last["锐度"] - first["锐度"]) / first["锐度"] * 100
     block_worst = max(s["块比"] for _, s in stats)
 
     print("-" * 78)
-    print("首→末：锐度 %+.1f%%   G/R 漂移 %+.2f%%" % (sharp_drop, g_drift))
+    print("基线锐度 %.2f ± %.2f（去掉前 %d 帧收敛段，波动 %+.1f%%）" % (base, spread, warm, rel_spread))
+    print("首帧 %.2f → 末帧 %.2f（%+.1f%%）　G/R 漂移 %+.2f%%　最高块比 %.2f" % (
+        first["锐度"], last["锐度"],
+        (last["锐度"] - first["锐度"]) / first["锐度"] * 100, g_drift, block_worst))
+
     verdict = []
     if abs(g_drift) > 3:
         verdict.append("颜色在漂（G/R 变化超过 3%）")
-    if sharp_drop < -25:
-        verdict.append("段内细节明显衰减（锐度掉超过 25%）")
     if block_worst > 1.3:
         verdict.append("有 16px 网格块效应")
-    print("结论：" + ("；".join(verdict) if verdict else "三项都在正常范围"))
-    return stats
+    if rel_spread > 12:
+        verdict.append("段内忽清忽糊（波动超过 12%）")
+    print("结论：" + ("；".join(verdict) if verdict else "整段稳定"))
+    print("提示：单条片子只能看稳不稳；「基线够不够锐」要和改参数前的另一条比 —— "
+          "把两个文件一起传给本脚本，直接比基线。")
+    return base
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         raise SystemExit(__doc__)
+    results = []
     for p in sys.argv[1:]:
-        report(p)
+        results.append((os.path.basename(p), report(p)))
+    if len(results) > 1:
+        print("=" * 78)
+        print("基线对比（越高越锐）：")
+        best = max(r[1] for r in results)
+        for name, base in sorted(results, key=lambda r: -r[1]):
+            print("  %-46s %6.2f  %+6.1f%%" % (name, base, (base / best - 1) * 100))
