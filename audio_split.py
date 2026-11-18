@@ -473,8 +473,8 @@ class DogkingAudioSplit:
     # 输出里**只有一个**「提示词」口：段内有独立词就出独立词，没有就出全局词。
     # 不再单独开「全局提示词」口 —— 两个口摆在一起，用户不知道接哪个，
     # 接错了还会把全局词无脑顶掉段内词，等于把「覆盖」功能绕过去了。
-    RETURN_TYPES = ("AUDIO", "STRING", "INT", "INT", "FLOAT", "AUDIO", "AUDIO")
-    RETURN_NAMES = ("音频", "提示词", "段序号", "段数", "本段时长", "选区音频", "对齐音频")
+    RETURN_TYPES = ("AUDIO", "STRING", "INT", "INT", "FLOAT", "AUDIO")
+    RETURN_NAMES = ("音频", "提示词", "段序号", "段数", "本段时长", "选区音频")
     FUNCTION = "split"
     CATEGORY = "dogking-tools"
     DESCRIPTION = (
@@ -539,12 +539,6 @@ class DogkingAudioSplit:
         overlap = max(0, int(前置重叠帧))
         lead = overlap / 24.0 if index > 0 else 0.0
         piece = slice_audio(audio, max(0.0, segment["start"] - lead), segment["end"])
-        # 「对齐音频」= 不带前置的那一份，长度正好等于裁剪后的画面。
-        #
-        # 画面那头把前 22 帧引导裁掉了，所以带前置的「音频」比画面长 22 帧；
-        # 拿它直接配预览视频，声音就会比画面早 0.917 秒（第 2 段起每一段都这样）。
-        # 生成要前置（给被钉住的画面当时间基准），预览要对齐 —— 两个口分开给。
-        aligned = piece if lead <= 0 else slice_audio(audio, segment["start"], segment["end"])
         prompt = resolve_prompt(segment, 全局提示词)
         duration = max(0.0, float(segment["end"]) - float(segment["start"]))
 
@@ -575,7 +569,7 @@ class DogkingAudioSplit:
                 "dogking_badge": ["%d/%d · %.1fs" % (index + 1, total, duration)],
                 "dogking_index": [index + 1],
             },
-            "result": (piece, prompt, index + 1, out_total, duration, 选区音频, aligned),
+            "result": (piece, prompt, index + 1, out_total, duration, 选区音频),
         }
 
     @staticmethod
