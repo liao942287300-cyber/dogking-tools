@@ -76,10 +76,18 @@ function injectStyles() {
   display: flex;
   align-items: center;
   gap: 8px;
+  /* 面板被拖窄时换行，而不是把按钮挤成「选/择/音/频」竖排 */
+  flex-wrap: wrap;
+  row-gap: 4px;
   padding: 3px 6px;
   border-radius: 6px;
   background: rgba(90, 130, 220, 0.10);
   border: 1px solid rgba(120, 150, 210, 0.22);
+}
+/* 按钮文字永远单行：这是「竖排」的唯一根因（flex 允许收缩 + 可换行） */
+.dk-as button {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 .dk-as-exec-dot {
   flex: 0 0 auto;
@@ -90,8 +98,10 @@ function injectStyles() {
   box-shadow: 0 0 6px rgba(63, 211, 154, 0.7);
 }
 .dk-as-exec-text {
-  flex: 1 1 auto;
-  min-width: 0;
+  /* 下限要够放下「顺序 · 第 1 / 8 段 · 15.00s」整句（约 175px）：
+     窄到放不下时让后面的控件换行，而不是把状态文字截成「顺序 · 第 1 / 8 …」 */
+  flex: 1 1 210px;
+  min-width: 210px;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
@@ -107,7 +117,7 @@ function injectStyles() {
 }
 .dk-as-jump {
   flex: 0 0 auto;
-  width: 52px;
+  width: 44px;
   padding: 2px 4px !important;
   border: 1px solid rgba(140, 170, 255, 0.35);
   border-radius: 5px;
@@ -116,6 +126,20 @@ function injectStyles() {
   font: inherit;
   font-size: 12px !important;
   text-align: center;
+}
+.dk-as-flash {
+  flex: 0 0 auto;
+  display: none;
+  padding: 2px 8px;
+  border-radius: 5px;
+  background: rgba(255, 200, 90, 0.14);
+  border: 1px solid rgba(255, 200, 90, 0.35);
+  color: #ffd479;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .dk-as-tools {
   flex: 0 0 auto;
@@ -453,6 +477,10 @@ class AudioSplitPanel {
 
     exec.append(this.execDot, this.execEl, this.jumpInput, this.btnJump, this.btnResetSeq);
 
+    /* 提示行：独立一行，不再覆盖上面那个文件名 —— 以前 flash() 直接写 nameEl，
+       「已回到第 1 段」会把「voice.wav · 0:32.08」永久顶掉，窄面板下还被截成「已回到第_」。 */
+    this.flashEl = el("div", "dk-as-flash");
+
     /* 工具行 */
     const tools = el("div", "dk-as-tools");
     this.btnCut = el("button", "", "加切点");
@@ -473,7 +501,7 @@ class AudioSplitPanel {
     /* 段清单 */
     this.listEl = el("div", "dk-as-list");
 
-    this.el.append(bar, wrap, prog, exec, tools, this.listEl);
+    this.el.append(bar, wrap, prog, exec, this.flashEl, tools, this.listEl);
     this.mount.appendChild(this.el);
 
     /* 事件（全部隔离，别让画布跟着动） */
@@ -819,7 +847,7 @@ class AudioSplitPanel {
       this.setActive(0, true);
       this.updateExecInfo();
       this.flash(this.segments.length
-        ? "已回到第 1 段，下次执行从 1 开始"
+        ? "已回到第 1 段 · 下次从 1 开始"
         : "已清空顺序游标（还没有分段）");
     } catch (err) {
       this.flash("重置失败：" + err);
@@ -857,7 +885,7 @@ class AudioSplitPanel {
       this.stopPlay();
       this.setActive(seg - 1, true);
       this.updateExecInfo();
-      this.flash(`下次执行从第 ${seg} 段开始`);
+      this.flash(`已跳到第 ${seg} 段 · 下次从 ${seg} 开始`);
     } catch (err) {
       this.flash("跳转失败：" + err);
     }
@@ -1724,8 +1752,25 @@ class AudioSplitPanel {
     if (this.readWidget("文件路径")) this.loadPeaks(false);
   }
 
+  /**
+   * 浮层提示：写在自己那一行，4 秒后自动收起来。
+   *
+   * 以前直接写 this.nameEl —— 那个元素显示的是「文件名 · 时长」，
+   * 点一次「回到第 1 段」就把文件名换成提示语、之后再也回不来，
+   * 面板一窄还被截成「已回到第_」。提示归提示，信息归信息。
+   */
   flash(text) {
-    this.nameEl.textContent = String(text || "");
+    const line = String(text || "").trim();
+    if (!this.flashEl) return;
+    if (this._flashTimer) clearTimeout(this._flashTimer);
+    this.flashEl.textContent = line;
+    this.flashEl.style.display = line ? "block" : "none";
+    if (line) {
+      this._flashTimer = setTimeout(() => {
+        this.flashEl.textContent = "";
+        this.flashEl.style.display = "none";
+      }, 4000);
+    }
   }
 }
 
