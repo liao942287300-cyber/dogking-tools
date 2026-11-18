@@ -350,7 +350,7 @@ def test_tail_is_not_counted_as_a_segment():
     assert len(_vc._existing_segments(work)) == 1
 
 
-# ---------------------------------------------------------------- 接缝过渡
+# ---------------------------------------------------------------- 接缝亮度过渡
 
 def _solid(n, level, h=32, w=32):
     return torch.full((n, h, w, 3), float(level), dtype=torch.float32)
@@ -363,54 +363,71 @@ def _read_mp4(path):
         return np.stack([f.to_ndarray(format="rgb24").mean() / 255.0 for f in c.decode(video=0)])
 
 
-def test_crossfade_blends_only_the_seam():
+def test_seam_brightness_ramps_instead_of_jumping():
     """
-    段与段是独立重绘的，曝光/锐度天然有一档差，硬切就是肉眼看到的「闪一下」。
-    过渡只能用在前几帧，后面的帧必须原样，否则整段都在重影。
+    每段开头几帧亮度偏高、随后回落，硬切就是「闪一下」。
+    过渡只能改亮度：接缝后第一帧要接近上一段末帧，几帧内回到本段水平。
     """
     root = _isolate()
     a = os.path.join(root, "a.mp4")
     b = os.path.join(root, "b.mp4")
-    _vc.encode_segment(_solid(8, 0.25), a, FPS)
-    _vc.encode_tail_lossless(_solid(8, 0.25), a, FPS)
-    _vc.encode_segment(_solid(8, 0.75), b, FPS)
-    _vc.encode_tail_lossless(_solid(8, 0.75), b, FPS)
+    _vc.encode_segment(_solid(8, 0.60), a, FPS)
+    _vc.encode_segment(_solid(8, 0.56), b, FPS)
 
     hard = os.path.join(root, "hard.mp4")
     soft = os.path.join(root, "soft.mp4")
-    n_hard = _vc.concat_segments([a, b], hard, FPS, None, crossfade=0, match_luma=False)
-    n_soft = _vc.concat_segments([a, b], soft, FPS, None, crossfade=4, match_luma=False)
-    assert n_hard == n_soft == 16, "过渡不能改变总帧数"
+    n1 = _vc.concat_segments([a, b], hard, FPS, None, seam_smooth=0, match_luma=False)
+    n2 = _vc.concat_segments([a, b], soft, FPS, None, seam_smooth=6, match_luma=False)
+    assert n1 == n2 == 16, "过渡不能改变总帧数"
 
     h = _read_mp4(hard)
     s = _read_mp4(soft)
-    assert abs(h[8] - 0.75) < 0.05, "硬切：接缝后应直接是第二段的颜色"
-    assert 0.30 < s[8] < 0.70, "过渡：接缝后第一帧应该是两段的混合（%.2f）" % s[8]
-    # 过渡结束后必须与硬切一致
-    for i in (13, 14, 15):
-        assert abs(s[i] - h[i]) < 0.03, "第 %d 帧被过渡污染了" % i
+    assert abs(h[8] - 0.56) < 0.05, "硬切：接缝后直接是第二段水平"
+    assert abs(s[8] - 0.60) < 0.06, "过渡：接缝后第一帧应贴近上一段末帧（%.3f）" % s[8]
+    assert abs(s[14] - 0.56) < 0.05, "过渡结束后应回到本段水平（%.3f）" % s[14]
 
 
-def test_crossfade_without_tail_is_harmless():
-    """老片段没有 _tail.mkv 时不能报错，退回硬切。"""
+def test_seam_transition_never_touches_content():
+    """
+    只许改亮度，不许混画面 —— 混画面等于倒退时间，出重影。
+    同一个像素减去均值后的形状必须与原帧成严格比例。
+    """
+    import av
+    import numpy as np
+
     root = _isolate()
-    a = os.path.join(root, "a.mp4")
-    b = os.path.join(root, "b.mp4")
-    _vc.encode_segment(_solid(6, 0.25), a, FPS)
-    _vc.encode_segment(_solid(6, 0.75), b, FPS)
+    src = os.path.join(root, "g.mp4")
+    grad = torch.linspace(0, 1, 32).view(1, 1, 32, 1).expand(8, 32, 32, 3).contiguous()
+    _vc.encode_segment(grad, src, FPS)
 
     out = os.path.join(root, "o.mp4")
-    n = _vc.concat_segments([a, b], out, FPS, None, crossfade=4, match_luma=False)
-    assert n == 12
-    frames = _read_mp4(out)
-    assert abs(frames[6] - 0.75) < 0.06, "没有尾帧副本时应该原样硬切"
+    plain = os.path.join(root, "plain.mp4")
+    _vc.concat_segments([src, src], out, FPS, None, seam_smooth=6, match_luma=False)
+    _vc.concat_segments([src, src], plain, FPS, None, seam_smooth=0, match_luma=False)
+
+    def frames(p):
+        with av.open(p) as c:
+            return [f.to_ndarray(format="rgb24").astype(np.float32) for f in c.decode(video=0)]
+
+    raw = frames(plain)
+    got = frames(out)
+    assert len(raw) == len(got) == 16
+    for i in (8, 9, 10):
+        r = raw[i].flatten() - raw[i].mean()
+        g = got[i].flatten() - got[i].mean()
+        if g.std() < 1e-3:
+            continue
+        ratio = (g * r).sum() / max((r * r).sum(), 1e-6)
+        corr = float(np.corrcoef(g, r)[0, 1])
+        assert corr > 0.999, "第 %d 帧的内容被改动了（相关性 %.4f）" % (i, corr)
+        assert float(np.abs(g - r * ratio).mean()) < 2.5, "第 %d 帧不是纯增益（残差来自 x264 量化）" % i
 
 
-def test_crossfade_node_default_is_four():
-    """节点默认 4 帧（0.17s），0 = 关。"""
+def test_seam_transition_default_is_six():
+    """节点默认 6 帧，0 = 硬切。"""
     spec = _vc.DogkingVideoConcat.INPUT_TYPES()["optional"]["接缝过渡"]
-    assert spec[1]["default"] == 4
-    assert spec[1]["min"] == 0 and spec[1]["max"] >= 8
+    assert spec[1]["default"] == 6
+    assert spec[1]["min"] == 0 and spec[1]["max"] >= 12
 
 
 # ---------------------------------------------------------------- 逐段亮度对齐

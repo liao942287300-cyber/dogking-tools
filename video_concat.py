@@ -304,21 +304,23 @@ def _write_audio(container, stream, data, rate, max_seconds=None):
     return round(total / float(rate), 3)
 
 
-def concat_segments(files, out_path, fps, audio=None, crossfade=0, match_luma=True):
+def concat_segments(files, out_path, fps, audio=None, seam_smooth=0, match_luma=True):
     """
     按给定顺序把若干 mp4 拼成一条。
 
     重编码而不是 remux：见模块文档。尺寸以第一段为准，不一致直接报错 ——
     混尺寸硬拼出来的画面会在接缝处跳一帧黑边。
 
-    接缝过渡（crossfade > 0）
-    ------------------------
-    每段是独立重绘的，段与段的曝光/锐度/质感天然有一档差（实测接缝后亮度
-    掉 2~4、细节更硬），直接硬切就是肉眼看到的「闪一下」。
+    接缝亮度过渡（seam_smooth > 0）
+    ------------------------------
+    每段开头几帧亮度偏高、随后回落（实测接缝后 114.9 → 109.0），硬切就是
+    肉眼看到的「闪一下」。
 
-    做法：本段前 `crossfade` 帧与上一段的末 `crossfade` 帧按线性权重混合，
-    接缝处权重从上一段那侧起、几帧内过渡到本段那侧。帧数不变，音频不动。
-    上一段的无损尾帧（`_tail.mkv`）不在就跳过过渡，不报错。
+    **只调亮度，不混内容**：前 `seam_smooth` 帧的亮度从「上一段末帧的亮度」
+    线性过渡到「本段自己的稳定亮度」。曾经把两段画面按权重混合过 ——
+    那等于让画面倒退 K 帧时间，人物一动就是重影加一记明显的回跳，废案。
+
+    帧数不变、构图不变、音频不动。
     """
     import av
 
@@ -347,21 +349,20 @@ def concat_segments(files, out_path, fps, audio=None, crossfade=0, match_luma=Tr
         if audio_data is not None and audio_channels:
             audio_stream = _add_audio_stream(container, audio_data, audio_rate, audio_channels)
 
-        fade = max(0, int(crossfade))
-        prev_tail = []
-        prev_gain = 1.0
+        smooth = max(0, int(seam_smooth))
+        prev_luma = 0.0
         # 每段独立重绘，曝光会逐段漂（实测 5 段 110.6 → 101.6，掉 8%），
         # 硬拼起来接缝处就是一次「暗一下」。以第 1 段为基准把每段整体拉平。
         base_luma = segment_luma(files[0]) if match_luma else 0.0
         for path in files:
             gain = 1.0
+            luma = 0.0
             if match_luma and base_luma > 0:
                 luma = segment_luma(path)
                 if luma > 1e-6:
                     gain = min(1.18, max(0.85, base_luma / luma))
-            lead = []
-            if fade and prev_tail:
-                lead = prev_tail[-fade:]
+            else:
+                luma = segment_luma(path)
             with av.open(path) as part:
                 src = part.streams.video[0]
                 if int(src.codec_context.width) != width or int(src.codec_context.height) != height:
@@ -376,28 +377,29 @@ def concat_segments(files, out_path, fps, audio=None, crossfade=0, match_luma=Tr
                             height,
                         )
                     )
+                steady = luma * gain if luma > 1e-6 else 0.0
                 n_in = 0
                 for frame in part.decode(video=0):
                     arr = frame.to_ndarray(format="rgb24")
                     if gain != 1.0:
                         arr = (arr.astype("float32") * gain).round().clip(0, 255).astype("uint8")
-                    # 接缝过渡：前 fade 帧按 (1-a)*上一段尾帧 + a*本段帧 混合
-                    if lead and n_in < len(lead):
-                        k = n_in
-                        a = (k + 1.0) / (len(lead) + 1.0)
-                        old = lead[k].astype("float32")
-                        if prev_gain != 1.0:
-                            old = old * prev_gain
-                        arr = (old * (1.0 - a)
-                               + arr.astype("float32") * a).round().clip(0, 255).astype("uint8")
+                    # 接缝亮度过渡：前 smooth 帧的亮度从上一段末帧拉回本段水平。
+                    # 只乘标量增益，像素结构一点不动 —— 混合画面会倒退时间、出重影。
+                    if smooth and prev_luma > 0 and n_in < smooth and steady > 0:
+                        a = (n_in + 1.0) / (smooth + 1.0)
+                        target = prev_luma + (steady - prev_luma) * a
+                        cur = float(arr.mean())
+                        if cur > 1.0:
+                            fac = min(1.12, max(0.88, target / cur))
+                            arr = (arr.astype("float32") * fac).round().clip(0, 255).astype("uint8")
+                    prev_luma = float(arr.mean())
                     for packet in stream.encode(
                         av.VideoFrame.from_ndarray(arr, format="rgb24")
                     ):
                         container.mux(packet)
                     written += 1
                     n_in += 1
-            prev_tail = read_tail_frames(path, fade) if fade else []
-            prev_gain = gain
+
         for packet in stream.encode():        # 同样必须 flush
             container.mux(packet)
 
@@ -487,9 +489,10 @@ class DogkingVideoConcat:
                                "把每段整体拉平，接缝就不再「暗一下」。增益限制在 0.85~1.18",
                 }),
                 "接缝过渡": ("INT", {
-                    "default": 4, "min": 0, "max": 12, "step": 1,
-                    "tooltip": "合并时每段开头几帧与上一段末帧做线性混合，抹掉接缝处的"
-                               "曝光/锐度跳变。0 = 硬切。帧数不变、音频不动",
+                    "default": 6, "min": 0, "max": 24, "step": 1,
+                    "tooltip": "每段开头几帧的亮度从上一段末帧平滑拉回本段水平，抹掉接缝处"
+                               "的「闪一下」。只改亮度、不混画面（混画面会倒退时间、出重影）。"
+                               "0 = 硬切。帧数/构图/音频都不变",
                 }),
             },
         }
@@ -586,7 +589,7 @@ class DogkingVideoConcat:
 
         final_path = os.path.join(out_root, "%s_%s.mp4" % (name, stamp))
         total_frames = concat_segments(parts, final_path, fps, 音频,
-                                       crossfade=接缝过渡, match_luma=逐段亮度对齐)
+                                       seam_smooth=接缝过渡, match_luma=逐段亮度对齐)
 
         if not 合并后保留片段:
             _clear_dir(work_dir)
