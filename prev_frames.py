@@ -307,10 +307,10 @@ class DogkingPrevSegmentFrames:
                                "留 0 = 不判断",
                 }),
                 "去锐化": ("FLOAT", {
-                    "default": 0.35, "min": 0.0, "max": 0.9, "step": 0.05,
+                    "default": 0.15, "min": 0.0, "max": 0.9, "step": 0.05,
                     "tooltip": "削弱引导帧的高频细节，把「越接越锐」的正反馈压下来。"
-                               "实测每段增益约 1.2 倍，0.35 让它落到 0.78（<1 就收敛）。"
-                               "0 = 不处理；0.5 以上细节会明显发软，不建议",
+                               "每段增益约 1.2 倍，0.35 会把趋势反向拉成「越接越软」"
+                               "（实测 18.0→14.7），所以默认降到 0.15。0 = 完全不处理",
                 }),
             },
         }
@@ -327,7 +327,7 @@ class DogkingPrevSegmentFrames:
 
     @classmethod
     def IS_CHANGED(cls, 段序号=1, 任务名="", 取末帧数=5, 片段根目录="", 缺段时="黑帧占位",
-                   段数=0, 去锐化=0.35):
+                   段数=0, 去锐化=0.15):
         # 片段被重写（重跑上一段）时要重算，否则会一直用旧的引导帧
         path, _kind = resolve_segment(段序号, 任务名, 片段根目录)
         try:
@@ -338,7 +338,7 @@ class DogkingPrevSegmentFrames:
             return "%s|missing|%d|%.2f" % (path or "-", int(段数), float(去锐化))
 
     def load_prev(self, 段序号, 任务名, 取末帧数=5, 片段根目录="", 缺段时="黑帧占位",
-                  段数=0, 去锐化=0.35):
+                  段数=0, 去锐化=0.15):
         idx = max(1, int(段序号))
         count = max(1, int(取末帧数))
         total = max(0, int(段数))
