@@ -227,7 +227,9 @@ class DogkingPrevSegmentFrames:
                 }),
                 "缺段时": (["黑帧占位", "报错"], {
                     "default": "黑帧占位",
-                    "tooltip": "黑帧占位：第 1 段/单段模式照常跑；报错：上一段没落盘就直接停下",
+                    "tooltip": "只对「段 2 以后、上一段文件不在」生效。"
+                               "黑帧占位：跳过引导照常跑；报错：直接停下，避免拼出缺段的成片。"
+                               "第 1 段和单段模式不受此项影响（本来就没有上一段）",
                 }),
             },
             "optional": {
@@ -278,16 +280,25 @@ class DogkingPrevSegmentFrames:
         want = align_guide_frames(取末帧数)
         path, source_kind = resolve_segment(idx, 任务名, 片段根目录)
 
-        # ---- 没有上一段：第 1 段、单段模式、或上一段没落盘
+        # ---- 没有上一段：第 1 段、或上一段没落盘
         if not path or not os.path.isfile(path):
+            # 段 1 是正常开局，天然没有上一段 —— 不管「缺段时」怎么选都不能报错。
+            # 之前这里连着一起判，选「报错」时第 1 段直接抛 ValueError，
+            # 等于整条流水线一开局就废掉。只有段 2 以后缺文件才是真漏跑。
             if not path:
-                reason = "第 %d 段没有上一段" % idx
-            else:
-                reason = "找不到上一段 %s" % os.path.basename(path)
+                status = "第 %d 段为起始段（正常开局）· 输出占位帧（不引导）" % idx
+                print("[dogking-tools] 上一段末帧：%s" % status)
+                return {
+                    "ui": {"dogking_status": [status]},
+                    "result": (_placeholder(), False, "", 1),
+                }
+
+            reason = "找不到上一段 %s" % os.path.basename(path)
             if str(缺段时) == "报错":
                 raise ValueError(
-                    "%s。先把上一段跑完（段号必须连续），或把「缺段时」改成「黑帧占位」"
-                    % reason
+                    "第 %d 段：%s。这一段之前的片段没落盘（漏跑/跳段/被清空），"
+                    "先把第 %d 段跑完再跑这一段；或把「缺段时」改成「黑帧占位」继续跑。"
+                    % (idx, reason, idx - 1)
                 )
             status = "无上一段 · %s · 输出占位帧（不引导）" % reason
             print("[dogking-tools] 上一段末帧：%s" % status)

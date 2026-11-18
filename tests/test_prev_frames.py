@@ -93,7 +93,7 @@ def test_first_segment_returns_placeholder():
     assert source == ""
     assert count == 1
     assert tuple(image.shape) == (1, _pf.PLACEHOLDER_SIZE, _pf.PLACEHOLDER_SIZE, 3)
-    assert "无上一段" in out["ui"]["dogking_status"][0]
+    assert "起始段" in out["ui"]["dogking_status"][0]
 
 
 def test_first_segment_never_touches_disk(tmp_path):
@@ -265,6 +265,33 @@ def test_missing_segment_raises_when_asked():
     with pytest.raises(ValueError) as err:
         _node().load_prev(段序号=4, 任务名="从没跑过", 缺段时="报错")
     assert "找不到上一段" in str(err.value)
+    # 报错信息要能指路：说清是第几段缺、缺的是第几段
+    assert "第 4 段" in str(err.value)
+    assert "第 3 段" in str(err.value)
+
+
+def test_first_segment_never_raises_even_when_asked():
+    """
+    段 1 天然没有上一段，选「报错」也不能抛 —— 否则一开局就废掉整条流。
+
+    实际踩过：缺段时=报错 时跑第 1 段直接 ValueError，任务队列红一片。
+    """
+    _isolate()
+    out = _node().load_prev(段序号=1, 任务名=NAME, 缺段时="报错")
+    image, has_prev, source, count = out["result"]
+
+    assert has_prev is False
+    assert source == ""
+    assert count == 1
+    assert tuple(image.shape)[0] == 1
+    assert "起始段" in out["ui"]["dogking_status"][0]
+
+
+def test_single_segment_mode_never_raises_even_when_asked():
+    """单段模式同理：段数=1 是正常调试，不该报错。"""
+    _isolate()
+    out = _node().load_prev(段序号=5, 任务名=NAME, 缺段时="报错", 段数=1)
+    assert out["result"][1] is False
 
 
 def test_audio_only_file_raises():
