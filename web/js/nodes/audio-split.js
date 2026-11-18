@@ -105,6 +105,18 @@ function injectStyles() {
   font-size: 12px !important;
   padding: 2px 8px !important;
 }
+.dk-as-jump {
+  flex: 0 0 auto;
+  width: 52px;
+  padding: 2px 4px !important;
+  border: 1px solid rgba(140, 170, 255, 0.35);
+  border-radius: 5px;
+  background: rgba(16, 22, 34, 0.9);
+  color: #e2ecff;
+  font: inherit;
+  font-size: 12px !important;
+  text-align: center;
+}
 .dk-as-tools {
   flex: 0 0 auto;
   display: flex;
@@ -428,7 +440,18 @@ class AudioSplitPanel {
     this.execEl = el("span", "dk-as-exec-text", "");
     this.btnResetSeq = el("button", "dk-as-reset", "↺ 回到第 1 段");
     this.btnResetSeq.title = "清掉顺序游标：下次执行从第 1 段重新开始（切点和提示词都不动）";
-    exec.append(this.execDot, this.execEl, this.btnResetSeq);
+
+    /* 跳到指定段：中途断掉 / 想补某一段时用，避免手改 state.json。
+       带上它就不用「回第 1 段」把前功尽弃 —— 已生成的片段一个都不动。 */
+    this.jumpInput = el("input", "dk-as-jump");
+    this.jumpInput.type = "number";
+    this.jumpInput.min = "1";
+    this.jumpInput.step = "1";
+    this.jumpInput.title = "下次执行从第几段开始（1 ~ 段数）";
+    this.btnJump = el("button", "dk-as-reset", "跳到");
+    this.btnJump.title = "把顺序游标设到这一段：下次执行从这里开始，已生成的片段不动";
+
+    exec.append(this.execDot, this.execEl, this.jumpInput, this.btnJump, this.btnResetSeq);
 
     /* 工具行 */
     const tools = el("div", "dk-as-tools");
@@ -470,6 +493,12 @@ class AudioSplitPanel {
     this.btnClear.addEventListener("click", () => this.clearSegments());
     this.btnRange.addEventListener("click", () => this.applyRange(0, this.duration));
     this.btnResetSeq.addEventListener("click", () => this.resetSequence());
+    this.btnJump.addEventListener("click", () => this.jumpSequence());
+    // 输入框里回车也跳，省一次鼠标
+    this.jumpInput.addEventListener("keydown", (e) => {
+      e.stopPropagation();          // 别让 ComfyUI 把回车当成排队
+      if (e.key === "Enter") this.jumpSequence();
+    });
 
     this.bindCanvas();
 
@@ -758,6 +787,10 @@ class AudioSplitPanel {
     }
     const len = seg.end - seg.start;
     this.execEl.textContent = `${mode} · 第 ${i + 1} / ${total} 段 · ${len.toFixed(2)}s`;
+    // 输入框跟着高亮段走；正在输入时不要抢用户打的字
+    if (this.jumpInput && document.activeElement !== this.jumpInput) {
+      this.jumpInput.value = String(i + 1);
+    }
     if (this.execDot) {
       this.execDot.style.background = this.playing >= 0 ? "#3fd39a" : "#5b8dff";
     }
@@ -790,6 +823,43 @@ class AudioSplitPanel {
         : "已清空顺序游标（还没有分段）");
     } catch (err) {
       this.flash("重置失败：" + err);
+    }
+  }
+
+  /**
+   * 把顺序游标设到面板上填的那一段，下次执行从它开始。
+   *
+   * 后台游标是 0 起的「下一条下标」，所以传 index = N - 1。
+   * 中途强杀 / 手动补跑都靠这个，比「回到第 1 段」温和 —— 已生成的
+   * seg_000N.mp4 一个都不动，只有下一次从哪段开始变了。
+   */
+  async jumpSequence() {
+    const total = this.segments.length;
+    if (!total) {
+      this.flash("还没有分段");
+      return;
+    }
+    const raw = Number.parseInt(this.jumpInput.value, 10);
+    const seg = Math.min(Math.max(Number.isFinite(raw) ? raw : 1, 1), total);
+    this.jumpInput.value = String(seg);
+
+    try {
+      const res = await api.fetchApi("/dogking-tools/reset", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ node: String(this.node.id ?? ""), index: seg - 1 }),
+      });
+      const data = await res.json();
+      if (!data?.ok) {
+        this.flash(data?.error || "跳转失败");
+        return;
+      }
+      this.stopPlay();
+      this.setActive(seg - 1, true);
+      this.updateExecInfo();
+      this.flash(`下次执行从第 ${seg} 段开始`);
+    } catch (err) {
+      this.flash("跳转失败：" + err);
     }
   }
 

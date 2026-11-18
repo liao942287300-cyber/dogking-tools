@@ -427,18 +427,24 @@ async def count(request):
 
 async def reset(request):
     """
-    清掉某个节点的计数（前端「重置计数」按钮用）。
+    清掉某个节点的计数，或者把计数设到指定位置。
+
+    前端两种按钮都用它：
+      - 「重置计数」/「↺ 回到第 1 段」：不带 index，等价于 index=0
+      - 音频分段的「跳到第 N 段」：带 index = N-1（顺序游标是 0 起的下一条下标）
 
     节点从来没有执行过时 state.json 里没有它的记录 —— 这种情况等同于
     「计数本来就是 0」，直接返回成功，前端不必弹错误框。
     body 里不带 node 时表示清空全部记录。
 
-    两个坑（都踩过）：
+    三个坑（都踩过）：
       1. 请求体畸形时绝不能落到「清空全部」分支 —— 否则任何一个坏请求
          都会把所有节点的进度抹掉。畸形请求一律当「没做事」返回成功。
       2. 读-改-写必须和 nodes.load() 共用 _state_lock。不然会出现
          load 读(index=3) → reset 写 0 → load 写回 4，重置被静默吞掉：
          界面提示「已重置」，下次却仍从下一行开始。
+      3. index 要显式校验。前端传个 "abc" 或负数时不能用默认值把人家
+         辛苦跑出来的进度悄悄清成 0 —— 宁可报错让用户看见。
     """
     try:
         body = await request.json()
@@ -456,23 +462,27 @@ async def reset(request):
         return web.json_response({"ok": True})
     node = str(raw_node).strip()
 
-    from .nodes import _load_state, _save_state, _state_lock
+    # 没给 index 就当 0（老的「重置计数」调用方都不带这个字段）
+    target = 0
+    if "index" in body:
+        raw_index = body.get("index")
+        try:
+            target = int(raw_index)
+        except (TypeError, ValueError):
+            return web.json_response({"ok": False, "error": "index 必须是整数"})
+        if target < 0:
+            return web.json_response({"ok": False, "error": "index 不能是负数"})
 
-    # 整段读-改-写持锁；返回值构造放到锁外面，别持锁做别的活
-    with _state_lock:
-        state = _load_state()
-        if node:
-            # isinstance 检查是必要的：_load_state() 只保证顶层是 dict，
-            # 用户手工把 state.json 编辑成 {"12": 5} 时 state[node]["index"]
-            # 会抛 TypeError 变成 500。脏数据静默跳过，宁可不做事也不能 500。
-            if isinstance(state.get(node), dict):
-                state[node]["index"] = 0
-                _save_state(state)
-        else:
+    from .nodes import _load_state, _save_state, _state_lock, set_index
+
+    if node:
+        set_index(node, target)      # 自带锁 + 脏数据保护
+    else:
+        with _state_lock:
             _save_state({})
 
     if node:
-        return web.json_response({"ok": True})
+        return web.json_response({"ok": True, "index": target})
     return web.json_response({"ok": True, "all": True})
 
 

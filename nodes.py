@@ -48,6 +48,41 @@ def _save_state(data):
         print(f"[dogking-tools] 保存状态失败：{e}")
 
 
+def set_index(node, index):
+    """
+    把某个节点的计数游标设成指定值（顺序游标是 0 起的「下一条下标」）。
+
+    「重置计数」和音频分段的「跳到第 N 段」共用这一条路径：
+      - 重置 = set_index(node, 0)
+      - 跳到第 N 段 = set_index(node, N - 1)
+
+    读-改-写必须和节点的 load() 共用 `_state_lock`，否则会出现
+    「load 读到 3 → 这里写 0 → load 又写回 4」的静默覆盖。
+    节点从没执行过（state 里没记录）时返回 False，调用方当「本来就是 0」处理即可。
+
+    @param {str} node 节点 id
+    @param {int} index 非负整数；负数按 0 处理
+    @returns {bool} 是否真的改到了记录
+    """
+    key = str(node or "").strip()
+    if not key:
+        return False
+    try:
+        value = max(0, int(index))
+    except (TypeError, ValueError):
+        value = 0
+
+    with _state_lock:
+        state = _load_state()
+        # 用户手工把 state.json 改成 {"12": 5} 时 state[key]["index"] 会 TypeError，
+        # 脏数据静默跳过，别让接口 500
+        if not isinstance(state.get(key), dict):
+            return False
+        state[key]["index"] = value
+        _save_state(state)
+    return True
+
+
 # ---------------------------------------------------------------- 文件解析
 
 def _resolve_path(path):
