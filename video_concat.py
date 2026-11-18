@@ -168,6 +168,36 @@ def segment_luma(path):
     return total / max(n, 1)
 
 
+def head_luma(path, probe=14, skip=2):
+    """
+    一段视频开头几帧的「本地影调」（采样 1/16 像素的亮度中位数）。
+
+    为什么不能用整段均值：整段亮度是跟着内容走的（实测同一段内 20 帧窗口在
+    101~114 之间来回），拿均值当目标会把接缝拉到「这段全片的平均亮度」，
+    而接缝紧邻的其实是「开头这十几帧的亮度」——两者能差 5 个点，拉错方向
+    反而造出一段假的渐变。
+
+    跳过前 skip 帧：第 0~1 帧正好是「上一段影调」的残留，用它当目标等于把
+    本段拽回上一段，接缝就白调了。
+    """
+    import av
+
+    vals = []
+    try:
+        with av.open(path) as container:
+            if not container.streams.video:
+                return 0.0
+            for i, frame in enumerate(container.decode(video=0)):
+                arr = frame.to_ndarray(format="rgb24")
+                vals.append(float(arr[::4, ::4].mean()))
+                if i + 1 >= probe:
+                    break
+    except Exception:  # noqa: BLE001
+        return 0.0
+    body = vals[skip:] or vals
+    return float(sorted(body)[len(body) // 2]) if body else 0.0
+
+
 def read_tail_frames(seg_path, count):
     """
     读 `seg_000N_tail.mkv` 的最后 count 帧（uint8 RGB ndarray 列表）。
@@ -317,8 +347,12 @@ def concat_segments(files, out_path, fps, audio=None, seam_smooth=0, match_luma=
     肉眼看到的「闪一下」。
 
     **只调亮度，不混内容**：前 `seam_smooth` 帧的亮度从「上一段末帧的亮度」
-    线性过渡到「本段自己的稳定亮度」。曾经把两段画面按权重混合过 ——
+    线性过渡到「本段开头十来帧的本地影调」。曾经把两段画面按权重混合过 ——
     那等于让画面倒退 K 帧时间，人物一动就是重影加一记明显的回跳，废案。
+
+    裁剪本身不会造成跳变：实测段 2 第 0 帧和段 1 末帧的差是 6.1，与段 1 内部
+    相邻帧的差（4.5~7.2）同级，时间上严丝合缝。看得见的跳变来自两次独立采样
+    的整体影调差（实测亮度 108.3 → 105.5，锐度 18.5 → 15.8）。
 
     帧数不变、构图不变、音频不动。
     """
@@ -377,7 +411,10 @@ def concat_segments(files, out_path, fps, audio=None, seam_smooth=0, match_luma=
                             height,
                         )
                     )
-                steady = luma * gain if luma > 1e-6 else 0.0
+                # 过渡目标用「本段开头这十几帧的本地影调」，不是整段均值：
+                # 整段亮度跟着内容走（同段内能差 5 个点），拿均值当目标会把
+                # 接缝往错方向拉，反倒造出一段假渐变。
+                steady = head_luma(path) * gain if luma > 1e-6 else 0.0
                 n_in = 0
                 for frame in part.decode(video=0):
                     arr = frame.to_ndarray(format="rgb24")

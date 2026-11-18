@@ -467,6 +467,53 @@ def test_luma_gain_is_bounded():
     assert os.path.isfile(out)
 
 
+# ---------------------------------------------------------------- 接缝目标：本地影调
+
+def test_head_luma_ignores_bright_lead_and_uses_local_tone():
+    """
+    过渡目标必须是「本段开头十几帧的影调」，不能是整段均值。
+
+    整段亮度跟着内容走（同一段内 20 帧窗口实测能差 13 个点），拿均值当目标会把
+    接缝往错方向拉；而且第 0~1 帧是上一段影调的残留，也要跳过。
+    """
+    import numpy as np
+
+    root = _isolate()
+    path = os.path.join(root, "tone.mp4")
+    frames = torch.cat([
+        _solid(3, 1.0),      # 头 3 帧：上一段影调的残留（很亮）
+        _solid(12, 0.30),    # 本地影调
+        _solid(40, 0.80),    # 后面整体变亮，把整段均值拉高
+    ], dim=0)
+    _vc.encode_segment(frames, path, FPS)
+
+    head = _vc.head_luma(path)
+    whole = _vc.segment_luma(path)
+    assert abs(head - 0.30 * 255) < 12, "本地影调应约 0.30（实际 %.1f）" % head
+    assert whole > 0.60 * 255, "整段均值应被后段拉高（实际 %.1f）" % whole
+
+
+def test_seam_target_follows_head_not_segment_mean():
+    """过渡只能把接缝拉到本段开头那十几帧的水平，不能拉到整段平均。"""
+    import av
+    import numpy as np
+
+    root = _isolate()
+    a = os.path.join(root, "a.mp4")
+    b = os.path.join(root, "b.mp4")
+    _vc.encode_segment(_solid(8, 0.70), a, FPS)
+    _vc.encode_segment(torch.cat([_solid(2, 0.70), _solid(10, 0.40), _solid(30, 0.95)], dim=0), b, FPS)
+
+    out = os.path.join(root, "o.mp4")
+    _vc.concat_segments([a, b], out, FPS, None, seam_smooth=6, match_luma=False)
+
+    with av.open(out) as c:
+        lums = [f.to_ndarray(format="rgb24").mean() / 255.0 for f in c.decode(video=0)]
+    # 接缝后第 8 帧（过渡已结束）应该已经落在 0.40 附近，不是整段均值 0.72
+    assert abs(lums[14] - 0.40) < 0.08, "过渡把画面拉向整段均值了（%.3f）" % lums[14]
+    assert lums[8] < 0.68, "接缝首帧没有被拉向本地影调（%.3f）" % lums[8]
+
+
 if __name__ == "__main__":
     import inspect
 
