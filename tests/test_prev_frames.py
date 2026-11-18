@@ -423,6 +423,67 @@ def test_is_changed_tracks_tail_file():
     assert sig_tail.endswith("|0") or "|missing" not in sig_tail
 
 
+# ---------------------------------------------------------------- 去锐化（抗累积过锐）
+
+def _noisy_image(n=6, h=64, w=64, seed=0):
+    """平滑渐变 + 细噪声：高频能量可控，便于验证衰减比例。"""
+    g = torch.linspace(0, 1, h).view(1, h, 1, 1).expand(n, h, w, 3)
+    gen = torch.Generator().manual_seed(seed)
+    noise = torch.rand(n, h, w, 3, generator=gen) * 0.25
+    return (g + noise).clamp(0, 1)
+
+
+def test_dehaze_zero_is_identity():
+    """去锐化=0 时必须字节级原样，不能顺手糊一下。"""
+    img = _noisy_image()
+    assert torch.equal(_pf.attenuate_high_freq(img, 0.0), img)
+
+
+def test_dehaze_scales_high_freq_by_amount():
+    """高频能量应当按 (1-amount) 缩放：这是让环路增益小于 1 的唯一依据。"""
+    img = _noisy_image()
+    base = _pf.high_freq_energy(img)
+    for amount in (0.2, 0.35, 0.5):
+        got = _pf.high_freq_energy(_pf.attenuate_high_freq(img, amount))
+        expect = base * (1.0 - amount)
+        assert abs(got - expect) / base < 0.06, (
+            "amount=%.2f 实际 %.5f，应约 %.5f" % (amount, got, expect)
+        )
+
+
+def test_dehaze_keeps_low_freq():
+    """低频（构图、颜色、明暗）不能被改动，否则接缝会跳。"""
+    img = _noisy_image()
+    low_a = _pf._blur(img, sigma=1.0)
+    low_b = _pf._blur(_pf.attenuate_high_freq(img, 0.5), sigma=1.0)
+    assert float((low_a - low_b).abs().max()) < 0.02
+    # 整体均值也要保持一致（不能整体变暗/变亮）
+    assert abs(float(img.mean()) - float(_pf.attenuate_high_freq(img, 0.5).mean())) < 0.01
+
+
+def test_dehaze_reported_in_status():
+    """状态行要写清削了多少，否则用户没法判断到底有没有生效。"""
+    root = _isolate()
+    _write_segment(root, count=20)
+
+    out = _node().load_prev(段序号=2, 任务名=NAME, 去锐化=0.35)
+    assert "去锐化 0.35" in out["ui"]["dogking_status"][0]
+    assert "高频 -" in out["ui"]["dogking_status"][0]
+
+    out2 = _node().load_prev(段序号=2, 任务名=NAME, 去锐化=0.0)
+    assert "去锐化" not in out2["ui"]["dogking_status"][0]
+
+
+def test_dehaze_from_workflow_default_still_five_frames():
+    """去锐化不能改变帧数和对齐结果。"""
+    root = _isolate()
+    _write_segment(root, count=40)
+    a = _node().load_prev(段序号=2, 任务名=NAME, 取末帧数=22, 去锐化=0.0)["result"]
+    b = _node().load_prev(段序号=2, 任务名=NAME, 取末帧数=22, 去锐化=0.35)["result"]
+    assert a[3] == b[3] == 22
+    assert tuple(a[0].shape) == tuple(b[0].shape)
+
+
 if __name__ == "__main__":
     import inspect
 
