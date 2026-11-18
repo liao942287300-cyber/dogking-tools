@@ -329,7 +329,7 @@ def test_output_ports_have_single_prompt_port():
     cls = _av.DogkingAudioSplit
     assert "全局提示词" not in cls.RETURN_NAMES
     assert cls.RETURN_NAMES.count("提示词") == 1
-    assert len(cls.RETURN_TYPES) == len(cls.RETURN_NAMES) == 6
+    assert len(cls.RETURN_TYPES) == len(cls.RETURN_NAMES) == 7
 
     segs = _segments((0, 1, "独立词"), (1, 2, ""))
     node = cls()
@@ -605,6 +605,51 @@ def test_pre_roll_status_mentions_it():
     segs = _segments((1, 3, ""), (3, 5, ""))
     assert "音频前置 22 帧" in _run_at(node, segs, 2, 22)["ui"]["dogking_status"][0]
     assert "音频前置" not in _run_at(node, segs, 1, 22)["ui"]["dogking_status"][0]
+
+
+# ---------------------------------------------------------------- 对齐音频（预览用）
+
+def test_aligned_audio_matches_cropped_video_length():
+    """
+    「对齐音频」必须和裁剪后的画面一样长。
+
+    带前置的「音频」比画面长 22 帧（0.917s）—— 拿去配预览视频，声音就早一截，
+    第 2 段起每一段都是这样，用户看到的就是「一采音画不同步」。
+    """
+    node = _av.DogkingAudioSplit()
+    segs = _segments((1, 3, ""), (3, 5, ""))
+
+    out2 = _run_at(node, segs, 2, 22)
+    piece, aligned = out2["result"][0], out2["result"][6]
+    assert _av.audio_duration(piece) == pytest.approx(2.0 + 22 / 24.0, abs=2e-3)
+    assert _av.audio_duration(aligned) == pytest.approx(2.0, abs=1e-3), \
+        "对齐音频应是纯段长 2.0s，实际 %.3fs" % _av.audio_duration(aligned)
+    # 起点也要对：从段起点 3.0s 开始，不是 3.0 − 22/24
+    assert float(aligned["waveform"].flatten()[0]) == pytest.approx(3.0, abs=3e-3)
+
+
+def test_aligned_equals_piece_when_no_pre_roll():
+    """没有前置时两份音频应当一致（第 1 段、或前置填 0）。"""
+    node = _av.DogkingAudioSplit()
+    segs = _segments((1, 3, ""), (3, 5, ""))
+
+    out1 = _run_at(node, segs, 1, 22)      # 第 1 段本来就没有前置
+    a, b = out1["result"][0], out1["result"][6]
+    assert _av.audio_duration(a) == pytest.approx(_av.audio_duration(b), abs=1e-6)
+
+    out0 = _run_at(node, segs, 2, 0)       # 前置 0
+    a0, b0 = out0["result"][0], out0["result"][6]
+    assert _av.audio_duration(a0) == pytest.approx(_av.audio_duration(b0), abs=1e-6)
+
+
+def test_aligned_clamps_when_segment_starts_before_roll():
+    """段起点比前导还短时也对得上：两者都从 0 开始。"""
+    node = _av.DogkingAudioSplit()
+    segs = _segments((0.0, 0.3, ""), (0.5, 2.5, ""))
+    out = _run_at(node, segs, 2, 22)
+    piece, aligned = out["result"][0], out["result"][6]
+    assert _av.audio_duration(piece) == pytest.approx(2.5, abs=2e-3)
+    assert _av.audio_duration(aligned) == pytest.approx(2.0, abs=2e-2)
 
 
 if __name__ == "__main__":
