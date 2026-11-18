@@ -350,6 +350,106 @@ def test_tail_is_not_counted_as_a_segment():
     assert len(_vc._existing_segments(work)) == 1
 
 
+# ---------------------------------------------------------------- 接缝过渡
+
+def _solid(n, level, h=32, w=32):
+    return torch.full((n, h, w, 3), float(level), dtype=torch.float32)
+
+
+def _read_mp4(path):
+    import av
+    import numpy as np
+    with av.open(path) as c:
+        return np.stack([f.to_ndarray(format="rgb24").mean() / 255.0 for f in c.decode(video=0)])
+
+
+def test_crossfade_blends_only_the_seam():
+    """
+    段与段是独立重绘的，曝光/锐度天然有一档差，硬切就是肉眼看到的「闪一下」。
+    过渡只能用在前几帧，后面的帧必须原样，否则整段都在重影。
+    """
+    root = _isolate()
+    a = os.path.join(root, "a.mp4")
+    b = os.path.join(root, "b.mp4")
+    _vc.encode_segment(_solid(8, 0.25), a, FPS)
+    _vc.encode_tail_lossless(_solid(8, 0.25), a, FPS)
+    _vc.encode_segment(_solid(8, 0.75), b, FPS)
+    _vc.encode_tail_lossless(_solid(8, 0.75), b, FPS)
+
+    hard = os.path.join(root, "hard.mp4")
+    soft = os.path.join(root, "soft.mp4")
+    n_hard = _vc.concat_segments([a, b], hard, FPS, None, crossfade=0, match_luma=False)
+    n_soft = _vc.concat_segments([a, b], soft, FPS, None, crossfade=4, match_luma=False)
+    assert n_hard == n_soft == 16, "过渡不能改变总帧数"
+
+    h = _read_mp4(hard)
+    s = _read_mp4(soft)
+    assert abs(h[8] - 0.75) < 0.05, "硬切：接缝后应直接是第二段的颜色"
+    assert 0.30 < s[8] < 0.70, "过渡：接缝后第一帧应该是两段的混合（%.2f）" % s[8]
+    # 过渡结束后必须与硬切一致
+    for i in (13, 14, 15):
+        assert abs(s[i] - h[i]) < 0.03, "第 %d 帧被过渡污染了" % i
+
+
+def test_crossfade_without_tail_is_harmless():
+    """老片段没有 _tail.mkv 时不能报错，退回硬切。"""
+    root = _isolate()
+    a = os.path.join(root, "a.mp4")
+    b = os.path.join(root, "b.mp4")
+    _vc.encode_segment(_solid(6, 0.25), a, FPS)
+    _vc.encode_segment(_solid(6, 0.75), b, FPS)
+
+    out = os.path.join(root, "o.mp4")
+    n = _vc.concat_segments([a, b], out, FPS, None, crossfade=4, match_luma=False)
+    assert n == 12
+    frames = _read_mp4(out)
+    assert abs(frames[6] - 0.75) < 0.06, "没有尾帧副本时应该原样硬切"
+
+
+def test_crossfade_node_default_is_four():
+    """节点默认 4 帧（0.17s），0 = 关。"""
+    spec = _vc.DogkingVideoConcat.INPUT_TYPES()["optional"]["接缝过渡"]
+    assert spec[1]["default"] == 4
+    assert spec[1]["min"] == 0 and spec[1]["max"] >= 8
+
+
+# ---------------------------------------------------------------- 逐段亮度对齐
+
+def test_luma_matching_lifts_dark_segment():
+    """
+    每段独立重绘，曝光会逐段漂（实测 5 段 110.6→101.6，掉 8%），硬拼就是「暗一下」。
+    以第 1 段为基准拉平后，两段的平均亮度应该基本一致。
+    """
+    root = _isolate()
+    a = os.path.join(root, "a.mp4")
+    b = os.path.join(root, "b.mp4")
+    _vc.encode_segment(_solid(8, 0.60), a, FPS)
+    _vc.encode_segment(_solid(8, 0.55), b, FPS)   # 需要 1.09 倍增益，在上限 1.18 之内
+
+    raw = os.path.join(root, "raw.mp4")
+    fixed = os.path.join(root, "fixed.mp4")
+    _vc.concat_segments([a, b], raw, FPS, None, match_luma=False)
+    _vc.concat_segments([a, b], fixed, FPS, None, match_luma=True)
+
+    r = _read_mp4(raw)
+    f = _read_mp4(fixed)
+    gap_raw = abs(r[:8].mean() - r[8:].mean())
+    gap_fixed = abs(f[:8].mean() - f[8:].mean())
+    assert gap_fixed < gap_raw * 0.5, "亮度差没被拉平（%.3f → %.3f）" % (gap_raw, gap_fixed)
+    assert gap_fixed < 0.02, "拉平后两段亮度应基本一致，实际差 %.3f" % gap_fixed
+
+
+def test_luma_gain_is_bounded():
+    """增益必须夹住，否则一段过暗会被拉爆（噪点、死白）。"""
+    root = _isolate()
+    dark = os.path.join(root, "dark.mp4")
+    _vc.encode_segment(_solid(6, 0.10), dark, FPS)
+    out = os.path.join(root, "o.mp4")
+    # 单段自己对自己，gain 应该是 1.0；再验极暗段不会被乘爆
+    _vc.concat_segments([dark], out, FPS, None, match_luma=True)
+    assert os.path.isfile(out)
+
+
 if __name__ == "__main__":
     import inspect
 

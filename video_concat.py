@@ -36,6 +36,7 @@ mp4 上做 packet 级 remux 会报 `Invalid argument`（实测：模板流 + tim
 而且不报错，只是播到最后少半秒。
 """
 
+import collections
 import os
 import re
 import time
@@ -151,6 +152,47 @@ def encode_tail_lossless(frames, seg_path, fps, count=TAIL_FRAMES):
     return n
 
 
+def segment_luma(path):
+    """一段视频的平均亮度（抽样 1/16 像素，够准又便宜）。给逐段亮度对齐用。"""
+    import av
+
+    total, n = 0.0, 0
+    try:
+        with av.open(path) as container:
+            for frame in container.decode(video=0):
+                arr = frame.to_ndarray(format="rgb24")
+                total += float(arr[::4, ::4].mean())
+                n += 1
+    except Exception:  # noqa: BLE001
+        return 0.0
+    return total / max(n, 1)
+
+
+def read_tail_frames(seg_path, count):
+    """
+    读 `seg_000N_tail.mkv` 的最后 count 帧（uint8 RGB ndarray 列表）。
+
+    这个副本是 ffv1 无损的、正好就是该段的结尾 —— 拿它给下一段做接缝过渡，
+    不会像读 mp4 那样再叠一层 crf14 的损失。文件不在就返回空列表，调用方
+    自己决定退回「不过渡」。
+    """
+    import av
+
+    path = tail_path_of(seg_path)
+    if not os.path.isfile(path):
+        return []
+    keep = collections.deque(maxlen=max(1, int(count)))
+    try:
+        with av.open(path) as container:
+            if not container.streams.video:
+                return []
+            for frame in container.decode(video=0):
+                keep.append(frame.to_ndarray(format="rgb24"))
+    except Exception:  # noqa: BLE001
+        return []
+    return list(keep)
+
+
 def encode_segment(frames, path, fps):
     """
     把一批帧编码成 mp4 片段。
@@ -262,12 +304,21 @@ def _write_audio(container, stream, data, rate, max_seconds=None):
     return round(total / float(rate), 3)
 
 
-def concat_segments(files, out_path, fps, audio=None):
+def concat_segments(files, out_path, fps, audio=None, crossfade=0, match_luma=True):
     """
     按给定顺序把若干 mp4 拼成一条。
 
     重编码而不是 remux：见模块文档。尺寸以第一段为准，不一致直接报错 ——
     混尺寸硬拼出来的画面会在接缝处跳一帧黑边。
+
+    接缝过渡（crossfade > 0）
+    ------------------------
+    每段是独立重绘的，段与段的曝光/锐度/质感天然有一档差（实测接缝后亮度
+    掉 2~4、细节更硬），直接硬切就是肉眼看到的「闪一下」。
+
+    做法：本段前 `crossfade` 帧与上一段的末 `crossfade` 帧按线性权重混合，
+    接缝处权重从上一段那侧起、几帧内过渡到本段那侧。帧数不变，音频不动。
+    上一段的无损尾帧（`_tail.mkv`）不在就跳过过渡，不报错。
     """
     import av
 
@@ -296,7 +347,21 @@ def concat_segments(files, out_path, fps, audio=None):
         if audio_data is not None and audio_channels:
             audio_stream = _add_audio_stream(container, audio_data, audio_rate, audio_channels)
 
+        fade = max(0, int(crossfade))
+        prev_tail = []
+        prev_gain = 1.0
+        # 每段独立重绘，曝光会逐段漂（实测 5 段 110.6 → 101.6，掉 8%），
+        # 硬拼起来接缝处就是一次「暗一下」。以第 1 段为基准把每段整体拉平。
+        base_luma = segment_luma(files[0]) if match_luma else 0.0
         for path in files:
+            gain = 1.0
+            if match_luma and base_luma > 0:
+                luma = segment_luma(path)
+                if luma > 1e-6:
+                    gain = min(1.18, max(0.85, base_luma / luma))
+            lead = []
+            if fade and prev_tail:
+                lead = prev_tail[-fade:]
             with av.open(path) as part:
                 src = part.streams.video[0]
                 if int(src.codec_context.width) != width or int(src.codec_context.height) != height:
@@ -311,13 +376,28 @@ def concat_segments(files, out_path, fps, audio=None):
                             height,
                         )
                     )
+                n_in = 0
                 for frame in part.decode(video=0):
                     arr = frame.to_ndarray(format="rgb24")
+                    if gain != 1.0:
+                        arr = (arr.astype("float32") * gain).round().clip(0, 255).astype("uint8")
+                    # 接缝过渡：前 fade 帧按 (1-a)*上一段尾帧 + a*本段帧 混合
+                    if lead and n_in < len(lead):
+                        k = n_in
+                        a = (k + 1.0) / (len(lead) + 1.0)
+                        old = lead[k].astype("float32")
+                        if prev_gain != 1.0:
+                            old = old * prev_gain
+                        arr = (old * (1.0 - a)
+                               + arr.astype("float32") * a).round().clip(0, 255).astype("uint8")
                     for packet in stream.encode(
                         av.VideoFrame.from_ndarray(arr, format="rgb24")
                     ):
                         container.mux(packet)
                     written += 1
+                    n_in += 1
+            prev_tail = read_tail_frames(path, fade) if fade else []
+            prev_gain = gain
         for packet in stream.encode():        # 同样必须 flush
             container.mux(packet)
 
@@ -401,6 +481,16 @@ class DogkingVideoConcat:
                     "default": False,
                     "tooltip": "最后一段合并完成后，留着这一轮的临时片段（排查接缝问题时会用到）",
                 }),
+                "逐段亮度对齐": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "每段生成的曝光会逐段漂（实测 5 段掉 8%），以第 1 段为基准"
+                               "把每段整体拉平，接缝就不再「暗一下」。增益限制在 0.85~1.18",
+                }),
+                "接缝过渡": ("INT", {
+                    "default": 4, "min": 0, "max": 12, "step": 1,
+                    "tooltip": "合并时每段开头几帧与上一段末帧做线性混合，抹掉接缝处的"
+                               "曝光/锐度跳变。0 = 硬切。帧数不变、音频不动",
+                }),
             },
         }
 
@@ -415,7 +505,8 @@ class DogkingVideoConcat:
     )
 
     def concat(self, 图像, 段序号, 段数, fps, 任务名,
-               音频=None, 开始时清空旧片段=True, 合并后保留片段=False, **kwargs):
+               音频=None, 开始时清空旧片段=True, 合并后保留片段=False,
+               接缝过渡=4, 逐段亮度对齐=True, **kwargs):
         # 兼容旧工作流：这两个开关原来叫「清空旧片段」/「保留片段」。
         # UI 重开会按新名字重建 widget，但直接提交的 API 格式工作流会把旧 key 传进来，
         # 不认就 TypeError —— 这里接住并映射，老工作流不用改动。
@@ -494,7 +585,8 @@ class DogkingVideoConcat:
             )
 
         final_path = os.path.join(out_root, "%s_%s.mp4" % (name, stamp))
-        total_frames = concat_segments(parts, final_path, fps, 音频)
+        total_frames = concat_segments(parts, final_path, fps, 音频,
+                                       crossfade=接缝过渡, match_luma=逐段亮度对齐)
 
         if not 合并后保留片段:
             _clear_dir(work_dir)
