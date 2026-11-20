@@ -131,3 +131,55 @@ def test_cursor_actually_moves_loader(state, tmp_path):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# ---------------------------------------------------------- set_index_all（游标隔离后的全量重置）
+
+def test_index_all_resets_project_keys_too(state):
+    """裸 key 和「节点|音频」项目 key 必须一起清 —— 只清裸 key，
+    「回到第 1 段」按了等于没按（2026-11-20 实测）。"""
+    _seed(**{
+        "543": {"audio_sig": "a", "index": 4},
+        "543|可愛くてごめん": {"audio_sig": "a", "index": 2},
+        "543|另一首": {"audio_sig": "b", "index": 1},
+        "999": {"audio_sig": "x", "index": 7},
+    })
+    changed = nodes.set_index_all("543", 0)
+    st = nodes._load_state()
+    assert changed == 3
+    assert st["543"]["index"] == 0
+    assert st["543|可愛くてごめん"]["index"] == 0
+    assert st["543|另一首"]["index"] == 0
+    assert st["999"]["index"] == 7          # 别人的进度一根汗毛都不能动
+
+
+def test_index_all_keeps_audio_sig(state):
+    """重置的是位置，不是项目身份：audio_sig 留着，切点没变就还认这个项目。"""
+    _seed(**{"543|歌": {"audio_sig": "sig-1", "index": 3}})
+    nodes.set_index_all("543", 0)
+    rec = nodes._load_state()["543|歌"]
+    assert rec["audio_sig"] == "sig-1"
+    assert rec["index"] == 0
+
+
+def test_index_all_dirty_record_is_replaced_not_crash(state):
+    """手工改坏的记录（裸数字）重置时直接换成正常记录，别 500。"""
+    _seed(**{"543|坏": 5, "543": {"index": 9}})
+    changed = nodes.set_index_all("543", 0)
+    assert changed == 2
+    st = nodes._load_state()
+    assert st["543|坏"] == {"index": 0}
+    assert st["543"]["index"] == 0
+
+
+def test_index_all_no_record_changes_nothing(state):
+    """全新节点（连项目 key 都没有）一条都不该造出来 —— 和 set_index 同一纪律。"""
+    _seed(**{"999": {"index": 1}})
+    assert nodes.set_index_all("543", 0) == 0
+    assert "543" not in nodes._load_state()
+
+
+def test_index_all_negative_becomes_zero(state):
+    _seed(**{"543|歌": {"index": 3}})
+    nodes.set_index_all("543", -5)
+    assert nodes._load_state()["543|歌"]["index"] == 0

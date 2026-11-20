@@ -43,6 +43,10 @@ const PANEL_HEIGHT = 538;   // 多了一行全局提示词输入；参考图已�
 const EVENT_NEXT = "dogking-tools.audio.next";
 /** 最小段长（秒）。比这更短的段切出来是噪音，拖到头就当合并 */
 const MIN_GAP = 0.06;
+/** 可成段的最低时长。0.06 只是拖切点的噪音底线，真到生成端，0.5 秒都
+    不够 H3 的 17k+5 帧账本 —— 短成这样的段一律并进邻段（提示词/图跟着走），
+    不然一个 0.06 秒的碎段挂在段清单顶上，既没法生成还占一行。 */
+const SEG_MIN = 0.5;
 /** 边界判定的像素容差：离切点这么近就认为是「想拖这条线」 */
 const HIT_PX = 9;
 /** 波形高度 */
@@ -52,6 +56,13 @@ const WAVE_H = 150;
  * 后端用它决定返回几个图片口，前端用它决定画几个槽。
  */
 const MAX_REFS = 6;
+
+/* 存活面板登记：点「运行」排队前要把还没落盘的提示词全部 flush 进 widget
+   （排队走的是 widget 快照，输入框里没失焦的字会丢） */
+const LIVE_PANELS = new Set();
+/* 段对象身份证：commit 会整表重建段对象，输入框闭包必须按 uid 找当前对象，
+   抓旧对象等于把字写进垃圾桶 */
+let SEG_UID = 0;
 /** 短边限制默认值，和后端 REF_SHORT_EDGE_DEFAULT 保持一致 */
 const REF_SHORT_DEFAULT = 1024;
 
@@ -804,6 +815,8 @@ class AudioSplitPanel {
 
     this.bindCanvas();
 
+    LIVE_PANELS.add(this);
+
     /* 6 个全局参考图槽画在节点顶部那块空白里（不是面板内部）。
        挂上去之后节点每次重绘都会带上，面板高度因此不用再留这 96px。 */
     this.bindNodeCanvas();
@@ -1188,6 +1201,7 @@ class AudioSplitPanel {
     const hi = Math.max(lo, hiRaw);
 
     const out = [];
+    let carry = null;   // 头部碎段的提示词/图没地方去时先拿着，并进第一个成活的段
     for (const raw of this.segments) {
       const start = Math.max(lo, Math.min(Number(raw.start) || 0, hi));
       const end = Math.max(start, Math.min(Number(raw.end) || 0, hi));
@@ -1195,20 +1209,34 @@ class AudioSplitPanel {
       // 每段的参考图必须跟着段一起搬 —— 这里整表重建，漏一个字段就等于
       // 用户配好的图被「改一下提示词」顺手清空了
       const images = cleanPaths(raw.images);
+      // uid 跟着段走：整表重建后输入框闭包还靠它找当前对象（见 setSegmentPrompt）
+      const uid = raw.uid || ++SEG_UID;
       if (!out.length) {
-        if (end - start >= MIN_GAP) out.push({ start, end, prompt, images });
+        if (end - start >= SEG_MIN) {
+          const first = { uid, start, end, prompt, images };
+          if (carry) {
+            if (!first.prompt) first.prompt = carry.prompt;
+            if (!first.images.length && carry.images.length) first.images = carry.images;
+            carry = null;
+          }
+          out.push(first);
+        } else {
+          // 头部碎段丢不得 —— 它的提示词可能是用户手输的唯一一份
+          carry = { prompt, images };
+        }
         continue;
       }
       const prev = out[out.length - 1];
       const st = prev.end;                        // 强制共边
-      // 留 1e-6 的余量：12.06 - 12 在浮点里是 0.0600000000000005，直接和 0.06 比会漏掉
-      if (end - st <= MIN_GAP + 1e-6) {
+      // 不足 SEG_MIN 的碎段并进前一段（含正好 0.06 秒的）—— 0.5 秒连
+      // H3 的最小帧账本都凑不出来，留着只会变成一段没法生成的垃圾
+      if (end - st <= SEG_MIN) {
         prev.end = Math.max(prev.end, end);       // 碎段（含正好 0.06 秒的）并进前一段
         if (!prev.prompt) prev.prompt = prompt;
         // 碎段自己的参考图一起带过去（前一段有图就以它为准）
         if (!prev.images.length && images.length) prev.images = images;
       } else {
-        out.push({ start: st, end, prompt, images });
+        out.push({ uid, start: st, end, prompt, images });
       }
     }
     if (!out.length) return;
@@ -2366,6 +2394,7 @@ class AudioSplitPanel {
 
     this.segments.forEach((seg, i) => {
       if (!Array.isArray(seg.images)) seg.images = [];
+      if (!seg.uid) seg.uid = ++SEG_UID;
       const row = document.createElement("div");
       const isPlaying = i === this.playing;
       const isActive = i === this.active;
@@ -2407,8 +2436,14 @@ class AudioSplitPanel {
       input.placeholder = "沿用全局提示词";
       input.addEventListener("pointerdown", (e) => e.stopPropagation());
       input.addEventListener("change", () => {
-        seg.prompt = input.value.trim();
+        this.setSegmentPrompt(seg.uid, input.value);
         this.commit();
+      });
+      // 只等 change（失焦/回车）不够：填完直接点「运行」不会失焦，
+      // widget 里还是旧值，排队跑出去的那份就没有这段提示词
+      input.addEventListener("input", () => {
+        this.setSegmentPrompt(seg.uid, input.value);
+        this.scheduleCommit();
       });
 
       const del = document.createElement("button");
@@ -2532,6 +2567,36 @@ class AudioSplitPanel {
       }
     }
     this.node.setDirtyCanvas?.(true, true);
+  }
+
+  /**
+   * 按 uid 把提示词写进**当前**段对象。
+   *
+   * commit 内部的 normalizeSegments 会整表重建段对象 —— 输入框闭包里抓着的
+   * 旧对象在第一次 commit 之后就不在数组里了，直接 `seg.prompt = x` 是把字
+   * 写进垃圾桶：界面看着还在，下次重建列表就「消失」。2026-11-20 实测，
+   * 填 3 段提示词实际只落盘第 1 段，剩下的在点「回到第 1 段」/执行完刷新后全丢。
+   */
+  setSegmentPrompt(uid, value) {
+    const seg = this.segments.find((s) => s.uid === uid);
+    if (seg) seg.prompt = String(value ?? "").trim();
+  }
+
+  /** 连续输入时防抖写 widget；排队前由 flushCommit 兜底 */
+  scheduleCommit() {
+    clearTimeout(this._commitTimer);
+    this._commitTimer = setTimeout(() => {
+      this._commitTimer = null;
+      this.commit();
+    }, 200);
+  }
+
+  /** 把还没落盘的输入立刻写进 widget（点运行排队前必须调） */
+  flushCommit() {
+    if (!this._commitTimer) return;
+    clearTimeout(this._commitTimer);
+    this._commitTimer = null;
+    this.commit();
   }
 
   commit() {
@@ -2776,6 +2841,15 @@ if (app && api) {
    * 用独立事件名（`dogking-tools.audio.next`），不碰「提示词批量加载」的
    * `dogking-tools.next` —— 两个节点同时在工作流里时不会互相排队。
    */
+  // 排队前 flush：排队提交的是 widget 快照，输入框里没失焦的字要抢先落盘
+  const origQueuePrompt = typeof app.queuePrompt === "function" ? app.queuePrompt.bind(app) : null;
+  if (origQueuePrompt) {
+    app.queuePrompt = function (...args) {
+      LIVE_PANELS.forEach((p) => p.flushCommit?.());
+      return origQueuePrompt(...args);
+    };
+  }
+
   let pendingContinue = false;
   let pendingNodeKey = "";
   api.addEventListener(EVENT_NEXT, (e) => {

@@ -171,59 +171,6 @@ def luma_mean(arr, stride=2):
     return float((sub @ LUMA_W).mean())
 
 
-def segment_color(path, stride=4):
-    """
-    一段视频的 RGB 均值与标准差（抽样 1/stride^2 像素）。
-
-    为什么要 std：只对均值做增益能修「亮/暗」，修不了「饱和/对比」。
-    实测同一批分段 3 段内饱和度 0.185 → 0.194 → 0.204，均值那一路几乎
-    看不出差别，必须连 std 一起搬。
-
-    返回 (mean, std) 两个长度 3 的 float64 数组；读不到返回 None。
-    """
-    import av
-
-    sums = np.zeros(3, dtype="float64")
-    sqs = np.zeros(3, dtype="float64")
-    n = 0
-    try:
-        with av.open(path) as container:
-            for frame in container.decode(video=0):
-                a = frame.to_ndarray(format="rgb24")[::stride, ::stride]
-                a = a.reshape(-1, 3).astype("float64")
-                sums += a.sum(0)
-                sqs += (a * a).sum(0)
-                n += a.shape[0]
-    except Exception:  # noqa: BLE001
-        return None
-    if n == 0:
-        return None
-    mean = sums / n
-    var = np.maximum(sqs / n - mean * mean, 0.0)
-    return mean, np.sqrt(var)
-
-
-def color_matrix(cur_mean, cur_std, ref_mean, ref_std, strength=1.0):
-    """
-    算逐通道的线性变换 (scale, offset)：out = x * scale + offset。
-
-    scale 来自 std 比例，但夹在 0.85~1.18 —— 和原来亮度增益同一个夹紧范围。
-    不夹的话某一段 std 特别小（画面偏平）会被拉得很硬，反而造出「跳一下
-    对比度」的观感，比原来的漂移更刺眼。
-    """
-    ref_std = np.maximum(np.asarray(ref_std, dtype="float64"), 1e-3)
-    cur_std = np.maximum(np.asarray(cur_std, dtype="float64"), 1e-3)
-    ref_mean = np.asarray(ref_mean, dtype="float64")
-    cur_mean = np.asarray(cur_mean, dtype="float64")
-
-    raw = ref_std / cur_std
-    scale = np.clip(raw, 0.85, 1.18)
-    s = float(max(0.0, min(1.0, strength)))
-    scale = 1.0 + (scale - 1.0) * s
-    offset = (ref_mean - cur_mean * scale) * s
-    return scale, offset
-
-
 def encode_segment(frames, path, fps):
     """
     把一批帧编码成 mp4 片段。
@@ -335,18 +282,12 @@ def _write_audio(container, stream, data, rate, max_seconds=None):
     return round(total / float(rate), 3)
 
 
-def concat_segments(files, out_path, fps, audio=None, match_luma=True):
+def concat_segments(files, out_path, fps, audio=None):
     """
     按给定顺序把若干 mp4 拼成一条。
 
     重编码而不是 remux：见模块文档。尺寸以第一段为准，不一致直接报错 ——
     混尺寸硬拼出来的画面会在接缝处跳一帧黑边。
-
-    逐段颜色匹配（match_luma=True）
-    ------------------------------
-    每段独立重绘，曝光和颜色都会逐段漂：实测 5 段亮度 110.6 → 101.6（-8%），
-    3 段饱和度 0.185 → 0.194 → 0.204（+10%）。以第 1 段为基准，按 RGB 三通道的
-    均值和标准差做一次线性变换把每段搬回去。只改色，不改构图、不改帧数、不动音频。
 
     段首过冲补偿（FIX_HEAD_OVERSHOOT）
     ------------------------------
@@ -386,18 +327,7 @@ def concat_segments(files, out_path, fps, audio=None, match_luma=True):
         if audio_data is not None and audio_channels:
             audio_stream = _add_audio_stream(container, audio_data, audio_rate, audio_channels)
 
-        # 每段独立重绘，曝光和颜色都会逐段漂：实测 5 段亮度 110.6 → 101.6（-8%），
-        # 3 段饱和度 0.185 → 0.194 → 0.204（+10%）。只拉亮度修不了后者，
-        # 所以这里按 RGB 三通道的均值和标准差一起搬，亮度只是其中一个分量。
-        base_color = segment_color(files[0]) if match_luma else None
         for seg_i, path in enumerate(files):
-            scale = None
-            offset = None
-            cur_color = segment_color(path) if match_luma else None
-            if match_luma and base_color and cur_color:
-                scale, offset = color_matrix(
-                    cur_color[0], cur_color[1], base_color[0], base_color[1]
-                )
             with av.open(path) as part:
                 src = part.streams.video[0]
                 if int(src.codec_context.width) != width or int(src.codec_context.height) != height:
@@ -421,13 +351,6 @@ def concat_segments(files, out_path, fps, audio=None, match_luma=True):
                 head_done = False       # 本段第 0 帧是否已经处理过
                 for frame in part.decode(video=0):
                     arr = frame.to_ndarray(format="rgb24")
-                    if scale is not None:
-                        # 逐通道线性变换：色偏、亮度、饱和一起搬。
-                        # 只做一次浮点乘加，不做直方图匹配 —— 后者在人物肤色上
-                        # 容易把某一段的整体色温硬拽过去，反而更像"换了个灯"。
-                        arr = np.clip(
-                            arr.astype("float32") * scale + offset, 0.0, 255.0
-                        ).round().astype("uint8")
 
                     if FIX_HEAD_OVERSHOOT and seg_i > 0 and not head_done:
                         head_done = True
@@ -543,13 +466,6 @@ class DogkingVideoConcat:
                     "default": False,
                     "tooltip": "最后一段合并完成后，留着这一轮的临时片段（排查接缝问题时会用到）",
                 }),
-                "逐段颜色匹配": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "每段重绘后亮度和颜色都会逐段漂：实测 5 段亮度掉 8%、"
-                               "3 段饱和度涨 10%。以第 1 段为基准，按 RGB 三通道的"
-                               "均值和标准差一起搬回去。只做线性变换，不改画面结构；"
-                               "增益限制在 0.85~1.18。接缝本身的亮度差不动",
-                }),
             },
         }
 
@@ -564,19 +480,15 @@ class DogkingVideoConcat:
     )
 
     def concat(self, 图像, 段序号, 段数, fps, 任务名,
-               音频=None, 开始时清空旧片段=True, 合并后保留片段=False,
-               逐段颜色匹配=True, **kwargs):
+               音频=None, 开始时清空旧片段=True, 合并后保留片段=False, **kwargs):
         # 兼容旧工作流：这两个开关原来叫「清空旧片段」/「保留片段」。
         # UI 重开会按新名字重建 widget，但直接提交的 API 格式工作流会把旧 key 传进来，
         # 不认就 TypeError —— 这里接住并映射，老工作流不用改动。
-        # 这个开关以前叫「逐段亮度对齐」，只调亮度。现在扩成三通道颜色匹配，
-        # 名字跟着改；旧工作流按 widget 位置传值本来就不受影响，API 格式的
-        # 旧 key 在这里接一下。
-        if "逐段亮度对齐" in kwargs:
-            逐段颜色匹配 = kwargs.pop("逐段亮度对齐")
-        # 老工作流（API 格式）还会带「接缝过渡」这个 key，接一下直接丢掉 ——
-        # 这个功能已经删除，合并时不再做任何接缝亮度补偿。
-        kwargs.pop("接缝过渡", None)
+        # 老工作流（API 格式）还会带这几个已删除功能的 key，接住直接丢掉：
+        # 「接缝过渡」「逐段亮度对齐」「逐段颜色匹配」——合并端不再做任何
+        # 接缝补偿和逐段校色，每段画面原样拼接。
+        for legacy in ("接缝过渡", "逐段亮度对齐", "逐段颜色匹配"):
+            kwargs.pop(legacy, None)
         if "清空旧片段" in kwargs:
             开始时清空旧片段 = kwargs.pop("清空旧片段")
         if "保留片段" in kwargs:
@@ -652,8 +564,7 @@ class DogkingVideoConcat:
             )
 
         final_path = os.path.join(out_root, "%s_%s.mp4" % (name, stamp))
-        total_frames = concat_segments(parts, final_path, fps, 音频,
-                                       match_luma=逐段颜色匹配)
+        total_frames = concat_segments(parts, final_path, fps, 音频)
 
         if not 合并后保留片段:
             _clear_dir(work_dir)

@@ -711,16 +711,18 @@ async def reset(request):
         if target < 0:
             return web.json_response({"ok": False, "error": "index 不能是负数"})
 
-    from .nodes import _load_state, _save_state, _state_lock, set_index
+    from .nodes import _load_state, _save_state, _state_lock, set_index_all
 
     if node:
-        set_index(node, target)      # 自带锁 + 脏数据保护
+        # 项目隔离后游标在「节点|音频」键下，裸 key 也可能还在 —— 全部一起清
+        # （2026-11-20 前只清裸 key，「回到第 1 段」按了等于没按）
+        changed = set_index_all(node, target)      # 自带锁 + 脏数据保护
     else:
         with _state_lock:
             _save_state({})
 
     if node:
-        return web.json_response({"ok": True, "index": target})
+        return web.json_response({"ok": True, "index": target, "changed": changed})
     return web.json_response({"ok": True, "all": True})
 
 

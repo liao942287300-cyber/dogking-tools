@@ -378,7 +378,7 @@ def test_head_overshoot_is_flattened():
     _vc.encode_segment(torch.cat([_solid(1, 0.68), _solid(9, 0.52)], dim=0), b, FPS)
 
     out = os.path.join(root, "o.mp4")
-    _vc.concat_segments([a, b], out, FPS, None, match_luma=False)
+    _vc.concat_segments([a, b], out, FPS, None)
     t = _read_mp4(out)
 
     assert len(t) == 20, "补偿不能改帧数（%d）" % len(t)
@@ -397,46 +397,9 @@ def test_head_fix_keeps_every_frame_of_a_single_frame_segment():
     _vc.encode_segment(_solid(1, 0.70), b, FPS)
 
     out = os.path.join(root, "o.mp4")
-    n = _vc.concat_segments([a, b], out, FPS, None, match_luma=False)
+    n = _vc.concat_segments([a, b], out, FPS, None)
     assert n == 6, "单帧段被吞掉了（写成 %d 帧）" % n
     assert len(_read_mp4(out)) == 6
-
-
-# ---------------------------------------------------------------- 逐段亮度对齐
-
-def test_luma_matching_lifts_dark_segment():
-    """
-    每段独立重绘，曝光会逐段漂（实测 5 段 110.6→101.6，掉 8%），硬拼就是「暗一下」。
-    以第 1 段为基准拉平后，两段的平均亮度应该基本一致。
-    """
-    root = _isolate()
-    a = os.path.join(root, "a.mp4")
-    b = os.path.join(root, "b.mp4")
-    _vc.encode_segment(_solid(8, 0.60), a, FPS)
-    _vc.encode_segment(_solid(8, 0.55), b, FPS)   # 需要 1.09 倍增益，在上限 1.18 之内
-
-    raw = os.path.join(root, "raw.mp4")
-    fixed = os.path.join(root, "fixed.mp4")
-    _vc.concat_segments([a, b], raw, FPS, None, match_luma=False)
-    _vc.concat_segments([a, b], fixed, FPS, None, match_luma=True)
-
-    r = _read_mp4(raw)
-    f = _read_mp4(fixed)
-    gap_raw = abs(r[:8].mean() - r[8:].mean())
-    gap_fixed = abs(f[:8].mean() - f[8:].mean())
-    assert gap_fixed < gap_raw * 0.5, "亮度差没被拉平（%.3f → %.3f）" % (gap_raw, gap_fixed)
-    assert gap_fixed < 0.02, "拉平后两段亮度应基本一致，实际差 %.3f" % gap_fixed
-
-
-def test_luma_gain_is_bounded():
-    """增益必须夹住，否则一段过暗会被拉爆（噪点、死白）。"""
-    root = _isolate()
-    dark = os.path.join(root, "dark.mp4")
-    _vc.encode_segment(_solid(6, 0.10), dark, FPS)
-    out = os.path.join(root, "o.mp4")
-    # 单段自己对自己，gain 应该是 1.0；再验极暗段不会被乘爆
-    _vc.concat_segments([dark], out, FPS, None, match_luma=True)
-    assert os.path.isfile(out)
 
 
 if __name__ == "__main__":

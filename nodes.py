@@ -83,6 +83,48 @@ def set_index(node, index):
     return True
 
 
+def set_index_all(node, index):
+    """
+    把一个节点的**全部游标记录**一起设成指定值。
+
+    游标按项目隔离之后（key = "节点id|音频文件名"），同一个分段节点上每个
+    音频各有一条记录，老的裸 key 也可能还在。「回到第 1 段 / 跳到第 N 段」
+    要清的是**这个节点**的游标 —— 只清裸 key 会漏掉项目 key，界面提示
+    「已重置」、下次却从原进度接着跑（2026-11-20 实测）。
+
+    audio_sig 保留不动：切点没变时进度语义不变，只是位置被指到 N。
+    裸 key 下没有记录（全新节点）时一条都不改，返回 0，调用方当
+    「本来就是 0」处理。
+
+    @param {str} node 节点 id
+    @param {int} index 非负整数；负数按 0 处理
+    @returns {int} 改掉的记录条数
+    """
+    key = str(node or "").strip()
+    if not key:
+        return 0
+    try:
+        value = max(0, int(index))
+    except (TypeError, ValueError):
+        value = 0
+
+    with _state_lock:
+        state = _load_state()
+        changed = 0
+        for k in list(state.keys()):
+            if k != key and not k.startswith(key + "|"):
+                continue
+            rec = state.get(k)
+            if isinstance(rec, dict):
+                rec["index"] = value
+            else:
+                state[k] = {"index": value}
+            changed += 1
+        if changed:
+            _save_state(state)
+    return changed
+
+
 # ---------------------------------------------------------------- 文件解析
 
 def _resolve_path(path):
