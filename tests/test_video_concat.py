@@ -350,7 +350,7 @@ def test_tail_is_not_counted_as_a_segment():
     assert len(_vc._existing_segments(work)) == 1
 
 
-# ---------------------------------------------------------------- 接缝亮度过渡
+# ---------------------------------------------------------------- 公共辅助
 
 def _solid(n, level, h=32, w=32):
     return torch.full((n, h, w, 3), float(level), dtype=torch.float32)
@@ -363,71 +363,43 @@ def _read_mp4(path):
         return np.stack([f.to_ndarray(format="rgb24").mean() / 255.0 for f in c.decode(video=0)])
 
 
-def test_seam_brightness_ramps_instead_of_jumping():
+# ---------------------------------------------------------------- 段首过冲补偿
+
+def test_head_overshoot_is_flattened():
     """
-    每段开头几帧亮度偏高、随后回落，硬切就是「闪一下」。
-    过渡只能改亮度：接缝后第一帧要接近上一段末帧，几帧内回到本段水平。
+    引导段之后的第一个自由生成帧会被模型画亮、第 1 帧回落（实测 +2.0~+8.6）。
+    合并时把第 0 帧压到第 1 帧的实测水平，第 1 帧及之后一帧不动。
     """
     root = _isolate()
     a = os.path.join(root, "a.mp4")
     b = os.path.join(root, "b.mp4")
-    _vc.encode_segment(_solid(8, 0.60), a, FPS)
-    _vc.encode_segment(_solid(8, 0.56), b, FPS)
-
-    hard = os.path.join(root, "hard.mp4")
-    soft = os.path.join(root, "soft.mp4")
-    n1 = _vc.concat_segments([a, b], hard, FPS, None, seam_smooth=0, match_luma=False)
-    n2 = _vc.concat_segments([a, b], soft, FPS, None, seam_smooth=6, match_luma=False)
-    assert n1 == n2 == 16, "过渡不能改变总帧数"
-
-    h = _read_mp4(hard)
-    s = _read_mp4(soft)
-    assert abs(h[8] - 0.56) < 0.05, "硬切：接缝后直接是第二段水平"
-    assert abs(s[8] - 0.60) < 0.06, "过渡：接缝后第一帧应贴近上一段末帧（%.3f）" % s[8]
-    assert abs(s[14] - 0.56) < 0.05, "过渡结束后应回到本段水平（%.3f）" % s[14]
-
-
-def test_seam_transition_never_touches_content():
-    """
-    只许改亮度，不许混画面 —— 混画面等于倒退时间，出重影。
-    同一个像素减去均值后的形状必须与原帧成严格比例。
-    """
-    import av
-    import numpy as np
-
-    root = _isolate()
-    src = os.path.join(root, "g.mp4")
-    grad = torch.linspace(0, 1, 32).view(1, 1, 32, 1).expand(8, 32, 32, 3).contiguous()
-    _vc.encode_segment(grad, src, FPS)
+    _vc.encode_segment(_solid(10, 0.50), a, FPS)
+    # 段 2：第 0 帧过冲到 0.68，第 1 帧起回到 0.52
+    _vc.encode_segment(torch.cat([_solid(1, 0.68), _solid(9, 0.52)], dim=0), b, FPS)
 
     out = os.path.join(root, "o.mp4")
-    plain = os.path.join(root, "plain.mp4")
-    _vc.concat_segments([src, src], out, FPS, None, seam_smooth=6, match_luma=False)
-    _vc.concat_segments([src, src], plain, FPS, None, seam_smooth=0, match_luma=False)
+    _vc.concat_segments([a, b], out, FPS, None, match_luma=False)
+    t = _read_mp4(out)
 
-    def frames(p):
-        with av.open(p) as c:
-            return [f.to_ndarray(format="rgb24").astype(np.float32) for f in c.decode(video=0)]
-
-    raw = frames(plain)
-    got = frames(out)
-    assert len(raw) == len(got) == 16
-    for i in (8, 9, 10):
-        r = raw[i].flatten() - raw[i].mean()
-        g = got[i].flatten() - got[i].mean()
-        if g.std() < 1e-3:
-            continue
-        ratio = (g * r).sum() / max((r * r).sum(), 1e-6)
-        corr = float(np.corrcoef(g, r)[0, 1])
-        assert corr > 0.999, "第 %d 帧的内容被改动了（相关性 %.4f）" % (i, corr)
-        assert float(np.abs(g - r * ratio).mean()) < 2.5, "第 %d 帧不是纯增益（残差来自 x264 量化）" % i
+    assert len(t) == 20, "补偿不能改帧数（%d）" % len(t)
+    assert abs(t[10] - 0.52) < 0.02, "第 0 帧没被压到第 1 帧水平（%.3f）" % t[10]
+    for i in range(11, 20):
+        assert abs(t[i] - 0.52) < 0.02, "第 %d 帧被动了（%.3f）" % (i, t[i])
+    assert abs(t[0] - 0.50) < 0.02, "首段被动了（%.3f）" % t[0]
 
 
-def test_seam_transition_default_is_six():
-    """节点默认 6 帧，0 = 硬切。"""
-    spec = _vc.DogkingVideoConcat.INPUT_TYPES()["optional"]["接缝过渡"]
-    assert spec[1]["default"] == 6
-    assert spec[1]["min"] == 0 and spec[1]["max"] >= 12
+def test_head_fix_keeps_every_frame_of_a_single_frame_segment():
+    """只有 1 帧的段：那帧被扣住后必须补写回去，不能静默丢帧。"""
+    root = _isolate()
+    a = os.path.join(root, "a.mp4")
+    b = os.path.join(root, "b.mp4")
+    _vc.encode_segment(_solid(5, 0.50), a, FPS)
+    _vc.encode_segment(_solid(1, 0.70), b, FPS)
+
+    out = os.path.join(root, "o.mp4")
+    n = _vc.concat_segments([a, b], out, FPS, None, match_luma=False)
+    assert n == 6, "单帧段被吞掉了（写成 %d 帧）" % n
+    assert len(_read_mp4(out)) == 6
 
 
 # ---------------------------------------------------------------- 逐段亮度对齐
@@ -465,53 +437,6 @@ def test_luma_gain_is_bounded():
     # 单段自己对自己，gain 应该是 1.0；再验极暗段不会被乘爆
     _vc.concat_segments([dark], out, FPS, None, match_luma=True)
     assert os.path.isfile(out)
-
-
-# ---------------------------------------------------------------- 接缝目标：本地影调
-
-def test_head_luma_ignores_bright_lead_and_uses_local_tone():
-    """
-    过渡目标必须是「本段开头十几帧的影调」，不能是整段均值。
-
-    整段亮度跟着内容走（同一段内 20 帧窗口实测能差 13 个点），拿均值当目标会把
-    接缝往错方向拉；而且第 0~1 帧是上一段影调的残留，也要跳过。
-    """
-    import numpy as np
-
-    root = _isolate()
-    path = os.path.join(root, "tone.mp4")
-    frames = torch.cat([
-        _solid(3, 1.0),      # 头 3 帧：上一段影调的残留（很亮）
-        _solid(12, 0.30),    # 本地影调
-        _solid(40, 0.80),    # 后面整体变亮，把整段均值拉高
-    ], dim=0)
-    _vc.encode_segment(frames, path, FPS)
-
-    head = _vc.head_luma(path)
-    whole = _vc.segment_luma(path)
-    assert abs(head - 0.30 * 255) < 12, "本地影调应约 0.30（实际 %.1f）" % head
-    assert whole > 0.60 * 255, "整段均值应被后段拉高（实际 %.1f）" % whole
-
-
-def test_seam_target_follows_head_not_segment_mean():
-    """过渡只能把接缝拉到本段开头那十几帧的水平，不能拉到整段平均。"""
-    import av
-    import numpy as np
-
-    root = _isolate()
-    a = os.path.join(root, "a.mp4")
-    b = os.path.join(root, "b.mp4")
-    _vc.encode_segment(_solid(8, 0.70), a, FPS)
-    _vc.encode_segment(torch.cat([_solid(2, 0.70), _solid(10, 0.40), _solid(30, 0.95)], dim=0), b, FPS)
-
-    out = os.path.join(root, "o.mp4")
-    _vc.concat_segments([a, b], out, FPS, None, seam_smooth=6, match_luma=False)
-
-    with av.open(out) as c:
-        lums = [f.to_ndarray(format="rgb24").mean() / 255.0 for f in c.decode(video=0)]
-    # 接缝后第 8 帧（过渡已结束）应该已经落在 0.40 附近，不是整段均值 0.72
-    assert abs(lums[14] - 0.40) < 0.08, "过渡把画面拉向整段均值了（%.3f）" % lums[14]
-    assert lums[8] < 0.68, "接缝首帧没有被拉向本地影调（%.3f）" % lums[8]
 
 
 if __name__ == "__main__":

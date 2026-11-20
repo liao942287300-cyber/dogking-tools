@@ -36,7 +36,6 @@ mp4 上做 packet 级 remux 会报 `Invalid argument`（实测：模板流 + tim
 而且不报错，只是播到最后少半秒。
 """
 
-import collections
 import os
 import re
 import time
@@ -152,75 +151,77 @@ def encode_tail_lossless(frames, seg_path, fps, count=TAIL_FRAMES):
     return n
 
 
-def segment_luma(path):
-    """一段视频的平均亮度（抽样 1/16 像素，够准又便宜）。给逐段亮度对齐用。"""
+# 段首过冲补偿总开关。不挂到节点 UI 上 —— 这是修生成端固有行为的一帧补丁，
+# 平时不需要动；真要关，把这里改成 False 即可。
+FIX_HEAD_OVERSHOOT = True
+
+# 亮度口径：加权 luma，不是 RGB 等权平均。
+# 等权等于把蓝色当成和绿色一样亮，人眼不是这么看的。
+LUMA_W = np.array([0.299, 0.587, 0.114], dtype="float32")
+
+
+def luma_mean(arr, stride=2):
+    """
+    一帧的加权亮度均值（0.299R + 0.587G + 0.114B），0~255 尺度。
+
+    抽样 1/stride 像素：亮度是全局平均，1/4 抽样（1/16 像素）的误差远小于
+    半个灰度级，但省掉四分之三的乘加。
+    """
+    sub = arr[::stride, ::stride].astype("float32")
+    return float((sub @ LUMA_W).mean())
+
+
+def segment_color(path, stride=4):
+    """
+    一段视频的 RGB 均值与标准差（抽样 1/stride^2 像素）。
+
+    为什么要 std：只对均值做增益能修「亮/暗」，修不了「饱和/对比」。
+    实测同一批分段 3 段内饱和度 0.185 → 0.194 → 0.204，均值那一路几乎
+    看不出差别，必须连 std 一起搬。
+
+    返回 (mean, std) 两个长度 3 的 float64 数组；读不到返回 None。
+    """
     import av
 
-    total, n = 0.0, 0
+    sums = np.zeros(3, dtype="float64")
+    sqs = np.zeros(3, dtype="float64")
+    n = 0
     try:
         with av.open(path) as container:
             for frame in container.decode(video=0):
-                arr = frame.to_ndarray(format="rgb24")
-                total += float(arr[::4, ::4].mean())
-                n += 1
+                a = frame.to_ndarray(format="rgb24")[::stride, ::stride]
+                a = a.reshape(-1, 3).astype("float64")
+                sums += a.sum(0)
+                sqs += (a * a).sum(0)
+                n += a.shape[0]
     except Exception:  # noqa: BLE001
-        return 0.0
-    return total / max(n, 1)
+        return None
+    if n == 0:
+        return None
+    mean = sums / n
+    var = np.maximum(sqs / n - mean * mean, 0.0)
+    return mean, np.sqrt(var)
 
 
-def head_luma(path, probe=14, skip=2):
+def color_matrix(cur_mean, cur_std, ref_mean, ref_std, strength=1.0):
     """
-    一段视频开头几帧的「本地影调」（采样 1/16 像素的亮度中位数）。
+    算逐通道的线性变换 (scale, offset)：out = x * scale + offset。
 
-    为什么不能用整段均值：整段亮度是跟着内容走的（实测同一段内 20 帧窗口在
-    101~114 之间来回），拿均值当目标会把接缝拉到「这段全片的平均亮度」，
-    而接缝紧邻的其实是「开头这十几帧的亮度」——两者能差 5 个点，拉错方向
-    反而造出一段假的渐变。
-
-    跳过前 skip 帧：第 0~1 帧正好是「上一段影调」的残留，用它当目标等于把
-    本段拽回上一段，接缝就白调了。
+    scale 来自 std 比例，但夹在 0.85~1.18 —— 和原来亮度增益同一个夹紧范围。
+    不夹的话某一段 std 特别小（画面偏平）会被拉得很硬，反而造出「跳一下
+    对比度」的观感，比原来的漂移更刺眼。
     """
-    import av
+    ref_std = np.maximum(np.asarray(ref_std, dtype="float64"), 1e-3)
+    cur_std = np.maximum(np.asarray(cur_std, dtype="float64"), 1e-3)
+    ref_mean = np.asarray(ref_mean, dtype="float64")
+    cur_mean = np.asarray(cur_mean, dtype="float64")
 
-    vals = []
-    try:
-        with av.open(path) as container:
-            if not container.streams.video:
-                return 0.0
-            for i, frame in enumerate(container.decode(video=0)):
-                arr = frame.to_ndarray(format="rgb24")
-                vals.append(float(arr[::4, ::4].mean()))
-                if i + 1 >= probe:
-                    break
-    except Exception:  # noqa: BLE001
-        return 0.0
-    body = vals[skip:] or vals
-    return float(sorted(body)[len(body) // 2]) if body else 0.0
-
-
-def read_tail_frames(seg_path, count):
-    """
-    读 `seg_000N_tail.mkv` 的最后 count 帧（uint8 RGB ndarray 列表）。
-
-    这个副本是 ffv1 无损的、正好就是该段的结尾 —— 拿它给下一段做接缝过渡，
-    不会像读 mp4 那样再叠一层 crf14 的损失。文件不在就返回空列表，调用方
-    自己决定退回「不过渡」。
-    """
-    import av
-
-    path = tail_path_of(seg_path)
-    if not os.path.isfile(path):
-        return []
-    keep = collections.deque(maxlen=max(1, int(count)))
-    try:
-        with av.open(path) as container:
-            if not container.streams.video:
-                return []
-            for frame in container.decode(video=0):
-                keep.append(frame.to_ndarray(format="rgb24"))
-    except Exception:  # noqa: BLE001
-        return []
-    return list(keep)
+    raw = ref_std / cur_std
+    scale = np.clip(raw, 0.85, 1.18)
+    s = float(max(0.0, min(1.0, strength)))
+    scale = 1.0 + (scale - 1.0) * s
+    offset = (ref_mean - cur_mean * scale) * s
+    return scale, offset
 
 
 def encode_segment(frames, path, fps):
@@ -334,27 +335,29 @@ def _write_audio(container, stream, data, rate, max_seconds=None):
     return round(total / float(rate), 3)
 
 
-def concat_segments(files, out_path, fps, audio=None, seam_smooth=0, match_luma=True):
+def concat_segments(files, out_path, fps, audio=None, match_luma=True):
     """
     按给定顺序把若干 mp4 拼成一条。
 
     重编码而不是 remux：见模块文档。尺寸以第一段为准，不一致直接报错 ——
     混尺寸硬拼出来的画面会在接缝处跳一帧黑边。
 
-    接缝亮度过渡（seam_smooth > 0）
+    逐段颜色匹配（match_luma=True）
     ------------------------------
-    每段开头几帧亮度偏高、随后回落（实测接缝后 114.9 → 109.0），硬切就是
-    肉眼看到的「闪一下」。
+    每段独立重绘，曝光和颜色都会逐段漂：实测 5 段亮度 110.6 → 101.6（-8%），
+    3 段饱和度 0.185 → 0.194 → 0.204（+10%）。以第 1 段为基准，按 RGB 三通道的
+    均值和标准差做一次线性变换把每段搬回去。只改色，不改构图、不改帧数、不动音频。
 
-    **只调亮度，不混内容**：前 `seam_smooth` 帧的亮度从「上一段末帧的亮度」
-    线性过渡到「本段开头十来帧的本地影调」。曾经把两段画面按权重混合过 ——
-    那等于让画面倒退 K 帧时间，人物一动就是重影加一记明显的回跳，废案。
+    段首过冲补偿（FIX_HEAD_OVERSHOOT）
+    ------------------------------
+    引导段之后的第一个自由生成帧会被模型画亮，实测 +2.0~+8.6 个灰度级，而且比
+    引导帧本身还亮 —— 是冲过头，不是被拉过去。第 1 帧自己就回落。
 
-    裁剪本身不会造成跳变：实测段 2 第 0 帧和段 1 末帧的差是 6.1，与段 1 内部
-    相邻帧的差（4.5~7.2）同级，时间上严丝合缝。看得见的跳变来自两次独立采样
-    的整体影调差（实测亮度 108.3 → 105.5，锐度 18.5 → 15.8）。
+    这里只压这一帧：第 0 帧先扣住，等第 1 帧解出来，按它的实测亮度做一次加性
+    偏移。目标直接取实测值，不预测任何东西；第 1 帧及之后一帧不动，首段跳过
+    （它没有引导帧，本来就没有这个过冲）。
 
-    帧数不变、构图不变、音频不动。
+    接缝本身的整体影调差不做补偿 —— 跨段那一档原样留着。
     """
     import av
 
@@ -383,20 +386,18 @@ def concat_segments(files, out_path, fps, audio=None, seam_smooth=0, match_luma=
         if audio_data is not None and audio_channels:
             audio_stream = _add_audio_stream(container, audio_data, audio_rate, audio_channels)
 
-        smooth = max(0, int(seam_smooth))
-        prev_luma = 0.0
-        # 每段独立重绘，曝光会逐段漂（实测 5 段 110.6 → 101.6，掉 8%），
-        # 硬拼起来接缝处就是一次「暗一下」。以第 1 段为基准把每段整体拉平。
-        base_luma = segment_luma(files[0]) if match_luma else 0.0
-        for path in files:
-            gain = 1.0
-            luma = 0.0
-            if match_luma and base_luma > 0:
-                luma = segment_luma(path)
-                if luma > 1e-6:
-                    gain = min(1.18, max(0.85, base_luma / luma))
-            else:
-                luma = segment_luma(path)
+        # 每段独立重绘，曝光和颜色都会逐段漂：实测 5 段亮度 110.6 → 101.6（-8%），
+        # 3 段饱和度 0.185 → 0.194 → 0.204（+10%）。只拉亮度修不了后者，
+        # 所以这里按 RGB 三通道的均值和标准差一起搬，亮度只是其中一个分量。
+        base_color = segment_color(files[0]) if match_luma else None
+        for seg_i, path in enumerate(files):
+            scale = None
+            offset = None
+            cur_color = segment_color(path) if match_luma else None
+            if match_luma and base_color and cur_color:
+                scale, offset = color_matrix(
+                    cur_color[0], cur_color[1], base_color[0], base_color[1]
+                )
             with av.open(path) as part:
                 src = part.streams.video[0]
                 if int(src.codec_context.width) != width or int(src.codec_context.height) != height:
@@ -411,31 +412,53 @@ def concat_segments(files, out_path, fps, audio=None, seam_smooth=0, match_luma=
                             height,
                         )
                     )
-                # 过渡目标用「本段开头这十几帧的本地影调」，不是整段均值：
-                # 整段亮度跟着内容走（同段内能差 5 个点），拿均值当目标会把
-                # 接缝往错方向拉，反倒造出一段假渐变。
-                steady = head_luma(path) * gain if luma > 1e-6 else 0.0
-                n_in = 0
+                # 段首过冲：引导段之后的第一个自由生成帧会被模型画亮
+                # （实测 +2.0~+8.6 个灰度级，且比引导帧本身还亮 —— 是冲过头，
+                # 不是被拉过去），第 1 帧自己就回落。这里把第 0 帧扣住，等第 1 帧
+                # 解出来再按它的实测亮度归位，不预测任何目标。
+                # 首段没有引导帧、本来就没有过冲，直接跳过。
+                pending = None          # 被扣住待修的第 0 帧
+                head_done = False       # 本段第 0 帧是否已经处理过
                 for frame in part.decode(video=0):
                     arr = frame.to_ndarray(format="rgb24")
-                    if gain != 1.0:
-                        arr = (arr.astype("float32") * gain).round().clip(0, 255).astype("uint8")
-                    # 接缝亮度过渡：前 smooth 帧的亮度从上一段末帧拉回本段水平。
-                    # 只乘标量增益，像素结构一点不动 —— 混合画面会倒退时间、出重影。
-                    if smooth and prev_luma > 0 and n_in < smooth and steady > 0:
-                        a = (n_in + 1.0) / (smooth + 1.0)
-                        target = prev_luma + (steady - prev_luma) * a
-                        cur = float(arr.mean())
-                        if cur > 1.0:
-                            fac = min(1.12, max(0.88, target / cur))
-                            arr = (arr.astype("float32") * fac).round().clip(0, 255).astype("uint8")
-                    prev_luma = float(arr.mean())
+                    if scale is not None:
+                        # 逐通道线性变换：色偏、亮度、饱和一起搬。
+                        # 只做一次浮点乘加，不做直方图匹配 —— 后者在人物肤色上
+                        # 容易把某一段的整体色温硬拽过去，反而更像"换了个灯"。
+                        arr = np.clip(
+                            arr.astype("float32") * scale + offset, 0.0, 255.0
+                        ).round().astype("uint8")
+
+                    if FIX_HEAD_OVERSHOOT and seg_i > 0 and not head_done:
+                        head_done = True
+                        pending = arr
+                        continue
+
+                    if pending is not None:     # 手里是第 1 帧，先把第 0 帧归位再写
+                        delta = luma_mean(arr) - luma_mean(pending)
+                        if abs(delta) > 0.5:
+                            pending = np.clip(
+                                pending.astype("float32") + delta, 0.0, 255.0
+                            ).round().astype("uint8")
+                        for packet in stream.encode(
+                            av.VideoFrame.from_ndarray(pending, format="rgb24")
+                        ):
+                            container.mux(packet)
+                        written += 1
+                        pending = None
+
                     for packet in stream.encode(
                         av.VideoFrame.from_ndarray(arr, format="rgb24")
                     ):
                         container.mux(packet)
                     written += 1
-                    n_in += 1
+
+                if pending is not None:         # 只有 1 帧的段，兜一下
+                    for packet in stream.encode(
+                        av.VideoFrame.from_ndarray(pending, format="rgb24")
+                    ):
+                        container.mux(packet)
+                    written += 1
 
         for packet in stream.encode():        # 同样必须 flush
             container.mux(packet)
@@ -520,16 +543,12 @@ class DogkingVideoConcat:
                     "default": False,
                     "tooltip": "最后一段合并完成后，留着这一轮的临时片段（排查接缝问题时会用到）",
                 }),
-                "逐段亮度对齐": ("BOOLEAN", {
+                "逐段颜色匹配": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "每段生成的曝光会逐段漂（实测 5 段掉 8%），以第 1 段为基准"
-                               "把每段整体拉平，接缝就不再「暗一下」。增益限制在 0.85~1.18",
-                }),
-                "接缝过渡": ("INT", {
-                    "default": 6, "min": 0, "max": 24, "step": 1,
-                    "tooltip": "每段开头几帧的亮度从上一段末帧平滑拉回本段水平，抹掉接缝处"
-                               "的「闪一下」。只改亮度、不混画面（混画面会倒退时间、出重影）。"
-                               "0 = 硬切。帧数/构图/音频都不变",
+                    "tooltip": "每段重绘后亮度和颜色都会逐段漂：实测 5 段亮度掉 8%、"
+                               "3 段饱和度涨 10%。以第 1 段为基准，按 RGB 三通道的"
+                               "均值和标准差一起搬回去。只做线性变换，不改画面结构；"
+                               "增益限制在 0.85~1.18。接缝本身的亮度差不动",
                 }),
             },
         }
@@ -546,10 +565,18 @@ class DogkingVideoConcat:
 
     def concat(self, 图像, 段序号, 段数, fps, 任务名,
                音频=None, 开始时清空旧片段=True, 合并后保留片段=False,
-               接缝过渡=4, 逐段亮度对齐=True, **kwargs):
+               逐段颜色匹配=True, **kwargs):
         # 兼容旧工作流：这两个开关原来叫「清空旧片段」/「保留片段」。
         # UI 重开会按新名字重建 widget，但直接提交的 API 格式工作流会把旧 key 传进来，
         # 不认就 TypeError —— 这里接住并映射，老工作流不用改动。
+        # 这个开关以前叫「逐段亮度对齐」，只调亮度。现在扩成三通道颜色匹配，
+        # 名字跟着改；旧工作流按 widget 位置传值本来就不受影响，API 格式的
+        # 旧 key 在这里接一下。
+        if "逐段亮度对齐" in kwargs:
+            逐段颜色匹配 = kwargs.pop("逐段亮度对齐")
+        # 老工作流（API 格式）还会带「接缝过渡」这个 key，接一下直接丢掉 ——
+        # 这个功能已经删除，合并时不再做任何接缝亮度补偿。
+        kwargs.pop("接缝过渡", None)
         if "清空旧片段" in kwargs:
             开始时清空旧片段 = kwargs.pop("清空旧片段")
         if "保留片段" in kwargs:
@@ -626,7 +653,7 @@ class DogkingVideoConcat:
 
         final_path = os.path.join(out_root, "%s_%s.mp4" % (name, stamp))
         total_frames = concat_segments(parts, final_path, fps, 音频,
-                                       seam_smooth=接缝过渡, match_luma=逐段亮度对齐)
+                                       match_luma=逐段颜色匹配)
 
         if not 合并后保留片段:
             _clear_dir(work_dir)

@@ -91,6 +91,66 @@ EMPTY_HINT = "还没有分段：点面板上的「自动等分」，或在波形
 # 三处各写一遍必然有一处漏掉某种格式。
 AUDIO_EXTENSIONS = (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus", ".wma")
 
+# 允许的参考图扩展名。前后端共用：后端挑图时过滤，缩略图接口也照这个放行。
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
+
+# 参考图槽位数。**必须和前端 MAX_REFS 一致** —— 后端决定返回几个图片口，
+# 前端决定画几个槽位；不一致就会出现「状态说 6 张，节点上只有 5 个口」。
+MAX_REFS = 6
+
+# 短边限制的默认值和红线。
+# 为什么是「短边」而不是「宽」或「高」：同一个工作流里既可能喂竖图也可能喂横图，
+# 按短边缩放才能保证两种图放进来尺寸量级一致，又不会把某一边撑到爆显存。
+REF_SHORT_EDGE_DEFAULT = 1024
+# 长边硬上限。6 张 4K 图一起进 VAE 会直接把显存吃干净，超过这个就再缩一档。
+REF_MAX_SIDE = 4096
+
+# H3 生成固定 24fps。帧数 ↔ 秒的换算全走这一个常量，别在各处再写 24。
+FPS = 24
+
+# 引导帧只认 17k+5（5 / 22 / 39 / 56…），其余值下游会悄悄往下取整。
+GUIDE_STEP = 17
+GUIDE_BASE = 5
+
+
+def align_guide_frames(n):
+    """
+    把任意帧数向下对齐到 17k+5，最小 5。
+
+    为什么要在这里对齐：同一个数要在三个地方用 —— 取上一段末几帧当引导、画面裁掉
+    开头几帧、音频往前多带几帧。只要有一处还是原始值（比如填了 17 而下游偷偷降到 5），
+    音画就会错位。所以由这个节点吐出去的永远是**对齐后**的数。
+    """
+    n = int(n)
+    if n <= 0:
+        return 0          # 0 = 不续接，别被下限抬成 5
+    n = max(GUIDE_BASE, n)
+    return n - (n - GUIDE_BASE) % GUIDE_STEP
+
+
+def segment_frame_plan(duration, overlap, has_prev):
+    """
+    一段的帧数账本。以前这是工作流里 4 个数学节点在算，现在收在这里。
+
+    @param {float} duration 本段真实时长（秒，不含前置）
+    @param {int} overlap 续接帧数（已对齐）
+    @param {bool} has_prev 是否有上一段（段 1 / 单段模式为 False）
+    @returns {(int, int, int, float)} (生成长度, 有效帧数, 画面裁剪起点, 音频起点秒)
+    """
+    # 生成侧：本段帧数对齐到 17k+5
+    seg_frames = max(GUIDE_BASE, round(duration * FPS))
+    seg_frames += (GUIDE_BASE - seg_frames % GUIDE_STEP) % GUIDE_STEP
+
+    # 有上一段时，前面要塞进 N 帧引导，生成长度要一起加长再对齐
+    gen_length = seg_frames + (overlap if has_prev else 0)
+    gen_length += (GUIDE_BASE - gen_length % GUIDE_STEP) % GUIDE_STEP
+
+    # 成片只保留「本段真实时长」这么多帧，引导帧全部裁掉
+    valid_frames = int(duration * FPS)
+    crop_start = overlap if has_prev else 0
+    audio_start = (overlap / float(FPS)) if has_prev else 0.0
+    return gen_length, valid_frames, crop_start, audio_start
+
 
 # ---------------------------------------------------------------- 分段表
 
@@ -132,10 +192,22 @@ def parse_segments(raw):
             continue
         if not (end > start):
             continue
+
+        # 每段的自定义参考图。空列表 / 缺字段都表示「沿用全局」，
+        # 所以这里统一收敛成 list，不留 None 给下游判断。
+        raw_images = item.get("images")
+        images = []
+        if isinstance(raw_images, (list, tuple)):
+            for entry in raw_images:
+                text = str(entry or "").strip()
+                if text and text not in images:
+                    images.append(text)
+
         out.append({
             "start": max(0.0, start),
             "end": end,
             "prompt": str(item.get("prompt") or "").strip(),
+            "images": images[:MAX_REFS],
         })
     out.sort(key=lambda seg: (seg["start"], seg["end"]))
     return out
@@ -152,6 +224,40 @@ def timeline_signature(segments):
     return hashlib.md5(("%d|" % len(segments) + joined).encode("utf-8")).hexdigest()[:12]
 
 
+def project_key(node_key, audio_path=""):
+    """
+    顺序游标的 key：**按「节点 + 音频」隔离**，不同项目各走各的。
+
+    为什么不能只用节点 id：同一个分段节点上，用户会换一段音频去做另一个项目。
+    排队跑的时候两个项目共用一条游标，就会互相推 —— A 跑完第 3 段、B 的 job 一执行
+    就接着记成「B 的第 4 段」，A 剩下的段全乱，最后合并报缺段。
+
+    用音频文件名区分，而不是再加一个「项目名」参数：换项目必然换音频，这是最自然的
+    区分，用户不用多填一个东西。用「音频」输入口时拿不到路径，退回节点级 ——
+    那种接法本来就只有一个音频源，不存在多项目混跑。
+    """
+    text = str(audio_path or "").strip().strip('"')
+    base = os.path.splitext(os.path.basename(text))[0] if text else ""
+    if not base:
+        return str(node_key or "0")
+    return "%s|%s" % (node_key or "0", base)
+
+
+def execution_signature(file_path, segments):
+    """
+    这一轮执行用的「项目指纹」：`音频文件名|段数`。
+
+    给前端做一件事：自动连续要排下一段之前，先比对界面上的参数还是不是刚跑的这一套。
+    用户跑到一半换项目（换音频）、或重新等分之后，指纹就变了 —— 这时**不能**自动排，
+    否则会拿新项目的参数去跑「上一段的下一段」，两个项目互相污染。
+
+    只取文件名和段数，不带时间：浮点数两端格式化会有极小的差异（`%.3f` 与 `toFixed`），
+    那会让自动连续永远排不上，比不比对还糟。
+    """
+    base = os.path.basename(str(file_path or "").strip().strip('"'))
+    return "%s|%d" % (base, len(segments or []))
+
+
 def resolve_prompt(segment, global_prompt):
     """
     该段的提示词：自己写了就用自己，空着回退全局。
@@ -163,6 +269,192 @@ def resolve_prompt(segment, global_prompt):
     if own:
         return own
     return str(global_prompt or "").strip()
+
+
+# ---------------------------------------------------------------- 参考图
+
+def parse_ref_config(raw):
+    """
+    解析「参考图数据」—— 全局参考图 + 短边限制。
+
+    格式：`{"short": 1024, "images": ["C:/a.png", ...]}`
+
+    容错优先：这是前端实时写进来的，可能还没初始化；老工作流里这个字段干脆不存在。
+    任何解析失败都退化成「没有参考图 + 默认短边」，绝不抛异常 —— 参考图是可选项，
+    不该因为它把整条片子卡死。
+
+    @returns {(int, list)} (短边限制, 全局参考图路径列表)
+    """
+    data = {}
+    try:
+        data = json.loads(str(raw or "").strip() or "{}")
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+
+    try:
+        short = int(data.get("short", REF_SHORT_EDGE_DEFAULT))
+    except (TypeError, ValueError):
+        short = REF_SHORT_EDGE_DEFAULT
+    short = max(0, min(short, 8192))
+
+    images = data.get("images")
+    if not isinstance(images, (list, tuple)):
+        images = []
+    picked = []
+    for item in images:
+        text = str(item or "").strip()
+        if text and text not in picked:
+            picked.append(text)
+    return short, picked[:MAX_REFS]
+
+
+def resolve_ref_paths(segment, global_images):
+    """
+    这一段该用哪几张参考图。
+
+    **段内有图就整组覆盖全局**，不是逐张合并 —— 用户的语义是「这一段换一批参考」。
+    逐张合并会造出「换掉第 2 张、另外 5 张还是全局的」这种半换状态，对接镜头切换
+    毫无用处，而且完全没法预期。
+
+    @returns {(list, str)} (路径列表, 来源 `segment` / `global` / 空串)
+    """
+    own = segment.get("images") if isinstance(segment, dict) else None
+    if isinstance(own, (list, tuple)):
+        picked = []
+        for item in own:
+            text = str(item or "").strip()
+            if text and text not in picked:
+                picked.append(text)
+        if picked:
+            return picked[:MAX_REFS], "segment"
+
+    kept = [str(p).strip() for p in (global_images or []) if str(p or "").strip()]
+    if kept:
+        return kept[:MAX_REFS], "global"
+    return [], ""
+
+
+def resolve_image_path(path):
+    """
+    参考图路径 → 存在的绝对路径。
+
+    和 `resolve_audio_path` 同款：绝对路径直接用，相对路径按 ComfyUI `input/`
+    目录解析（拖进节点上传的图就落在那里）。找不到返回空串。
+    """
+    text = str(path or "").strip().strip('"')
+    if not text:
+        return ""
+    if os.path.isfile(text):
+        return text
+
+    try:
+        import folder_paths
+
+        candidate = folder_paths.get_annotated_filepath(text)
+        if candidate and os.path.isfile(candidate):
+            return candidate
+        candidate = os.path.join(folder_paths.get_input_directory(), text)
+        if os.path.isfile(candidate):
+            return candidate
+    except Exception:
+        pass
+    return ""
+
+
+def load_reference_image(path, short_edge):
+    """
+    读一张参考图 → IMAGE 张量 `[1,H,W,3]`（float32，0~1）。
+
+    短边限制：`short_edge > 0` 就把**短边**缩到该值、长边等比。**不裁切、不补边** ——
+    裁切会切掉内容，补边会引入黑条，两者都会被 VAE 当成画面内容编码进去。放大也做：
+    1200 的短边配 1024 的限制时缩小，800 的短边配 1024 就放大，行为一致才好预期。
+
+    长边另有 4096 的硬上限：6 张 4K 一起进来会直接把显存吃干净。
+
+    @returns {(torch.Tensor|None, str)} (张量, 成功是 "宽x高"，失败是原因)
+    """
+    resolved = resolve_image_path(path)
+    if not resolved:
+        return None, "找不到文件"
+
+    ext = os.path.splitext(resolved)[1].lower()
+    if ext not in IMAGE_EXTENSIONS:
+        return None, "不是图片（%s）" % (ext or "无扩展名")
+
+    try:
+        import numpy as np
+        import torch
+        from PIL import Image
+    except Exception as e:  # noqa: BLE001
+        return None, "缺少图像库：%s" % e
+
+    try:
+        img = Image.open(resolved)
+        img = img.convert("RGB")
+        w, h = img.size
+        if w < 1 or h < 1:
+            return None, "尺寸为 0"
+
+        scale = 1.0
+        target = int(short_edge or 0)
+        if target > 0:
+            scale = target / float(min(w, h))
+        long_side = max(w, h) * scale
+        if long_side > REF_MAX_SIDE:
+            scale *= REF_MAX_SIDE / float(long_side)
+
+        if abs(scale - 1.0) > 1e-3:
+            nw = max(1, int(round(w * scale)))
+            nh = max(1, int(round(h * scale)))
+            img = img.resize((nw, nh), Image.LANCZOS)
+
+        arr = np.asarray(img, dtype=np.float32) / 255.0
+    except Exception as e:  # noqa: BLE001
+        return None, "读不出来：%s" % e
+
+    # PIL 的调色板 / 灰度已经在 convert("RGB") 时统一，这里一定是 3 通道
+    tensor = torch.from_numpy(np.ascontiguousarray(arr))[None, ...]
+    return tensor, "%dx%d" % (img.size[0], img.size[1])
+
+
+def build_reference_outputs(segment, ref_config, limit=MAX_REFS):
+    """
+    把一段的参考图准备成 `limit` 个输出值（不足补 None）。
+
+    为什么补 None 而不是灰图：这些口只有连着线时才会被下游取用，没连线时 ComfyUI
+    根本不读它。补灰图反而会把「没设第 3 张」变成「第 3 张是一张灰片」，静悄悄地
+    污染生成结果 —— 那比报错难查得多。
+
+    @returns {(tuple, str, list)} (输出元组, 状态描述, 每张图的尺寸说明)
+    """
+    short_edge, global_images = parse_ref_config(ref_config)
+    paths, source = resolve_ref_paths(segment, global_images)
+
+    tensors = []
+    sizes = []
+    failed = []
+    for path in paths:
+        tensor, info = load_reference_image(path, short_edge)
+        if tensor is None:
+            failed.append("%s %s" % (os.path.basename(str(path)), info))
+            continue
+        tensors.append(tensor)
+        sizes.append(info)
+
+    if not paths:
+        note = ""
+    elif source == "segment":
+        note = " · 参考图 %d 张（本段覆盖）" % len(tensors)
+    else:
+        note = " · 参考图 %d 张（全局）" % len(tensors)
+    if failed:
+        note += " · 失败 %d 张：%s" % (len(failed), "；".join(failed[:2]))
+
+    tensors = tensors[:limit]
+    outs = tuple(tensors) + (None,) * max(0, limit - len(tensors))
+    return outs, note, sizes
 
 
 # ---------------------------------------------------------------- 音频
@@ -424,9 +716,14 @@ class DogkingAudioSplit:
             "required": {
                 # 前端把分段表写进这里（widget 被改成隐藏类型，节点上看不到，
                 # 但工作流保存时会带上，所以每段的提示词不会丢）。
+                # 🔴 multiline 必须是 False。面板把它改成隐藏类型，但 ComfyUI 在
+                # **创建节点时**就按「多行文本」量了一次高度 —— 分段表是一整串 JSON，
+                # 6 段 300 多字符按控件宽度折行能折出十几行，节点顶部直接多出 366px
+                # 空白（实测），下面所有内容被挤掉。前端事后改属性也不会重算，
+                # 只有让定义层就是单行，布局才是 20px 一行。
                 "分段数据": ("STRING", {
                     "default": "",
-                    "multiline": True,
+                    "multiline": False,
                     "dynamicPrompts": False,
                     "tooltip": "内部字段：面板生成的 {segments:[{start,end,prompt}]}，不用手改",
                 }),
@@ -453,18 +750,34 @@ class DogkingAudioSplit:
                     "multiline": False,
                     "tooltip": "本机音频文件；接了「音频」输入口时以输入口为准",
                 }),
-                "前置重叠帧": ("INT", {
+                "续接帧数": ("INT", {
                     "default": 0, "min": 0, "max": 96, "step": 1,
-                    "tooltip": "本段音频往前多带几帧（24fps）上一段的尾巴，给「上一段末帧续接」的"
-                               "引导帧当时间基准。必须与画面「去重裁剪起点」完全一致，否则每段"
-                               "音画错位、口型越跑越快。默认 0 = 不前置（不影响其它工作流）；"
-                               "接了续接节点时填成和裁剪起点一样（22 帧方案 → 22）",
+                    "tooltip": "续接帧数 —— 全链唯一要填的数（24fps）。它同时决定："
+                               "① 取上一段末几帧当引导；② 画面裁掉开头几帧；③ 音频往前多带几帧。"
+                               "三个动作必须同值，所以收成一个参数，走「续接帧数」输出口往下发。"
+                               "自动对齐到 17k+5（5 / 22 / 39 / 56…）。默认 0 = 不续接。"
+                               "39 帧方案填 39",
                 }),
             },
             "optional": {
                 "音频": ("AUDIO", {
                     "forceInput": True,
                     "tooltip": "上游给的音频；接了就用它，忽略「文件路径」",
+                }),
+                # 全局参考图 + 短边限制。被面板改成隐藏类型，节点上不占 widget 行：
+                # 存 `{"short": 1024, "images": ["C:/a.png", ...]}`，
+                # 面板把它画成 6 个缩略图槽位 + 一个「短边」输入框。
+                #
+                # 🔴 必须放在**最后**：ComfyUI 的 widgets_values 是按位置存的，
+                # 在中间插一个新 widget 会让老工作流的每一个值都往后错一位
+                # （提示词变成输出模式、段号变成布尔值……）。放尾部就只是多一位。
+                "参考图数据": ("STRING", {
+                    "default": "",
+                    # 同理：单行。这个值虽然短（一两百字符），但一旦上了 6 张图
+                    # 路径能到 400 字符，多行一样会撑出空白
+                    "multiline": False,
+                    "dynamicPrompts": False,
+                    "tooltip": "内部字段：面板生成的 {short:1024, images:[路径…]}，不用手改",
                 }),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
@@ -473,14 +786,27 @@ class DogkingAudioSplit:
     # 输出里**只有一个**「提示词」口：段内有独立词就出独立词，没有就出全局词。
     # 不再单独开「全局提示词」口 —— 两个口摆在一起，用户不知道接哪个，
     # 接错了还会把全局词无脑顶掉段内词，等于把「覆盖」功能绕过去了。
-    RETURN_TYPES = ("AUDIO", "STRING", "INT", "INT", "FLOAT", "AUDIO")
-    RETURN_NAMES = ("音频", "提示词", "段序号", "段数", "本段时长", "选区音频")
+    #
+    # 后 6 个口是「分段参数」：帧数账本原来由 5 个数学节点分头算（本段帧数 / 生成长度 /
+    # 有效帧数 / 画面裁剪起点 / 音频起点），改一次帧数要同步 5 处，漏一处就音画错位。
+    # 收进这里之后全链只有一个「续接帧数」，其它全是它的派生值。
+    #
+    # 最后 6 个是参考图：每段吐当前该用的那几张（段内有图就覆盖全局），不足补 None。
+    # 追加在**尾部**是硬要求 —— 前端连线按输出下标存，插在中间会把已有连线整体错位。
+    RETURN_TYPES = (
+        "AUDIO", "STRING", "INT", "INT", "FLOAT", "AUDIO",
+        "INT", "INT", "INT", "FLOAT", "INT", "BOOLEAN",
+    ) + ("IMAGE",) * MAX_REFS
+    RETURN_NAMES = (
+        "音频", "提示词", "段序号", "段数", "本段时长", "选区音频",
+        "生成长度", "有效帧数", "裁剪起点", "音频起点", "续接帧数", "有上一段",
+    ) + tuple("图%d" % (i + 1) for i in range(MAX_REFS))
     FUNCTION = "split"
     CATEGORY = "dogking-tools"
     DESCRIPTION = (
-        "数字人音频分段：波形上自由切段，每段可写独立提示词（覆盖全局提示词）；"
-        "支持单段输出与顺序输出（配合自动连续按段跑完整个音频）。"
-        "「提示词」输出口已合并：有独立词出独立词，没有就出全局词。"
+        "数字人音频分段：波形上自由切段，每段可写独立提示词（覆盖全局提示词）、"
+        "也可单独指定参考图（覆盖全局参考图）；支持单段输出与顺序输出"
+        "（配合自动连续按段跑完整个音频）。"
     )
 
     @classmethod
@@ -490,7 +816,7 @@ class DogkingAudioSplit:
         return float("NaN")
 
     def split(self, 分段数据, 全局提示词, 输出模式, 当前段, 自动连续, 文件路径,
-              前置重叠帧=0, 音频=None, unique_id=None):
+              续接帧数=0, 参考图数据="", 音频=None, unique_id=None):
         key = str(unique_id or "0")
 
         segments = parse_segments(分段数据)
@@ -521,12 +847,16 @@ class DogkingAudioSplit:
             # 单段不该被别人切了 8 段牵连。
             out_total = 1
         else:
-            index, more = self._next_index(key, segments, total)
+            # 游标按「节点 + 音频」隔离：同一个节点上换音频做另一个项目，
+            # 两边进度各走各的。第二个 key 是老格式的兜底（见 _next_index）。
+            index, more = self._next_index(
+                [project_key(key, 文件路径), key], segments, total
+            )
             out_total = total
 
         segment = segments[index]
 
-        # 段 2 以后把音频往前多带 `前置重叠帧` 帧（上一段的尾巴）。
+        # 段 2 以后把音频往前多带 `续接帧数` 帧（上一段的尾巴）。
         #
         # 为什么必须这么做：画面那头「上一段末帧续接」把上一段的最后 N 帧钉在输出
         # 第 0..N-1 帧上，模型从第 N 帧才回到本段音频的起点。生成完再裁掉这 N 帧，
@@ -536,16 +866,30 @@ class DogkingAudioSplit:
         #
         # 「本段时长」仍然只报真正的段长（end - start），不能把前导算进去：
         # 下游的帧长算式和裁剪长度都基于它，多算了会连锁出错。
-        overlap = max(0, int(前置重叠帧))
-        lead = overlap / 24.0 if index > 0 else 0.0
+        #
+        # 单段模式（out_total == 1）即使跑的是第 3 段，也按「没有上一段」处理 ——
+        # 以前这里只判断 index > 0，单段调试第 3 段时音频前置了 1.6 秒而画面没裁，
+        # 音画直接错开一大截。现在统一走 has_prev 一个条件。
+        overlap = align_guide_frames(续接帧数)
+        has_prev = bool(index > 0 and out_total != 1)
+        lead = (overlap / float(FPS)) if has_prev else 0.0
+
         piece = slice_audio(audio, max(0.0, segment["start"] - lead), segment["end"])
         prompt = resolve_prompt(segment, 全局提示词)
         duration = max(0.0, float(segment["end"]) - float(segment["start"]))
 
-        status = "第 %d/%d 段（%.2f–%.2f 秒）%s%s" % (
+        gen_length, valid_frames, crop_start, audio_start = segment_frame_plan(
+            duration, overlap, has_prev
+        )
+
+        # 参考图：段内有图就用段内的（整组覆盖），否则用全局
+        ref_outs, ref_note, _ref_sizes = build_reference_outputs(segment, 参考图数据)
+
+        status = "第 %d/%d 段（%.2f–%.2f 秒）%s%s%s" % (
             index + 1, total, segment["start"], segment["end"],
             " · 独立提示词" if segment["prompt"] else "",
             (" · 音频前置 %d 帧" % overlap) if lead > 0 else "",
+            ref_note,
         )
         print("[dogking-tools] 音频分段：%s" % status)
 
@@ -568,8 +912,13 @@ class DogkingAudioSplit:
                 "dogking_status": [status],
                 "dogking_badge": ["%d/%d · %.1fs" % (index + 1, total, duration)],
                 "dogking_index": [index + 1],
+                # 项目指纹：前端自动连续排队前比对它，界面换过项目就不排（见 execution_signature）
+                "dogking_sig": [execution_signature(文件路径, segments)],
             },
-            "result": (piece, prompt, index + 1, out_total, duration, 选区音频),
+            "result": (
+                piece, prompt, index + 1, out_total, duration, 选区音频,
+                gen_length, valid_frames, crop_start, audio_start, overlap, has_prev,
+            ) + ref_outs,
         }
 
     @staticmethod
@@ -588,23 +937,36 @@ class DogkingAudioSplit:
         return to_comfy_audio(waveform, rate)
 
     @staticmethod
-    def _next_index(key, segments, total):
+    def _next_index(keys, segments, total):
         """
         顺序模式的游标：取当前下标，然后把游标推到下一个。
 
+        @param {list} keys 候选 key，**第一个是当前项目的**，后面是兜底（见 project_key）。
+                           读的时候按顺序找第一个有记录的，写的时候只写第一个。
         @returns {(int, bool)} (本次下标, 后面还有没有)
         """
+        keys = [k for k in keys if k]
         signature = timeline_signature(segments)
 
         with _state_lock:
             state = _load_state()
-            record = state.get(key)
-            # state.json 被手工改坏时 record 可能不是 dict，按「没有记录」处理
-            if not isinstance(record, dict):
-                record = {}
+
+            record = None
+            used_key = None
+            for k in keys:
+                found = state.get(k)
+                # state.json 被手工改坏时 record 可能不是 dict，当没记录处理
+                if isinstance(found, dict):
+                    record, used_key = found, k
+                    break
 
             # 切点变了 → 从头开始；只改提示词不会改签名，游标保持
-            if record.get("audio_sig") != signature:
+            if isinstance(record, dict) and record.get("audio_sig") == signature:
+                if used_key != keys[0]:
+                    # 老格式（纯节点 id）的记录，签名还对得上 = 同一个项目，
+                    # 搬到新 key 上，别让它跑到一半的进度凭空归零
+                    state.pop(used_key, None)
+            else:
                 record = {"audio_sig": signature, "index": 0}
 
             index = int(record.get("index", 0))
@@ -613,7 +975,7 @@ class DogkingAudioSplit:
 
             record["index"] = index + 1
             more = (index + 1) < total
-            state[key] = record
+            state[keys[0]] = record
             _save_state(state)
 
         return index, more

@@ -60,7 +60,7 @@ def _segments(*pairs):
 def test_parse_normal():
     segs = _av.parse_segments(_segments((0, 1.5, ""), (1.5, 3.0, "唱歌")))
     assert len(segs) == 2
-    assert segs[0] == {"start": 0.0, "end": 1.5, "prompt": ""}
+    assert segs[0] == {"start": 0.0, "end": 1.5, "prompt": "", "images": []}
     assert segs[1]["prompt"] == "唱歌"
 
 
@@ -329,7 +329,13 @@ def test_output_ports_have_single_prompt_port():
     cls = _av.DogkingAudioSplit
     assert "全局提示词" not in cls.RETURN_NAMES
     assert cls.RETURN_NAMES.count("提示词") == 1
-    assert len(cls.RETURN_TYPES) == len(cls.RETURN_NAMES) == 6
+    # 12 个固定口 + 6 个参考图口（图1~图6）。图片口**必须**在最后 ——
+    # 插在中间会让已保存工作流的连线按输出下标整体错位。
+    assert len(cls.RETURN_TYPES) == len(cls.RETURN_NAMES) == 12 + 6
+    assert cls.RETURN_NAMES[6:12] == (
+        "生成长度", "有效帧数", "裁剪起点", "音频起点", "续接帧数", "有上一段"
+    )
+    assert cls.RETURN_NAMES[12:] == ("图1", "图2", "图3", "图4", "图5", "图6")
 
     segs = _segments((0, 1, "独立词"), (1, 2, ""))
     node = cls()
@@ -534,12 +540,23 @@ def _ramp_audio(seconds=6.0, rate=8000):
 
 
 def _run_at(node, segments, cur, lead):
-    """单段模式指定段号：不碰 state.json 里的顺序游标，结果可重复。"""
-    return node.split(
-        分段数据=segments, 全局提示词="", 输出模式="单段", 当前段=cur,
-        自动连续=False, 文件路径="", 前置重叠帧=lead,
-        音频=_ramp_audio(), unique_id="lead-test",
-    )
+    """
+    取指定段号：走**顺序模式**连跑，用独立 unique_id 隔离游标。
+
+    不能用单段模式 —— 单段模式没有「上一段」可续（画面不裁、引导不取），
+    按设计就不该前置音频，测不到前导逻辑。
+    """
+    total = len(json.loads(segments)["segments"])
+    key = "lead-test-%d-%d-%d" % (id(node), cur, lead)
+    for _ in range(total + 2):
+        out = node.split(
+            分段数据=segments, 全局提示词="", 输出模式="顺序", 当前段=1,
+            自动连续=False, 文件路径="", 续接帧数=lead,
+            音频=_ramp_audio(), unique_id=key,
+        )
+        if out["result"][2] == cur:
+            return out
+    raise AssertionError("顺序模式没跑到第 %d 段" % cur)
 
 
 def test_first_segment_has_no_pre_roll():
@@ -644,3 +661,74 @@ if __name__ == "__main__":
                 failed += 1
     print(f"\n通过 {passed} / 失败 {failed} / 跳过 {skipped}")
     sys.exit(1 if failed else 0)
+
+
+# ---------------------------------------------------------------- ⑤ 帧数账本
+
+def test_guide_alignment():
+    """续接帧数一律向下对齐到 17k+5；0 保持 0（= 不续接）。"""
+    assert _av.align_guide_frames(0) == 0
+    assert _av.align_guide_frames(5) == 5
+    assert _av.align_guide_frames(17) == 5      # 17 不是合法档位，下游会降到 5
+    assert _av.align_guide_frames(22) == 22
+    assert _av.align_guide_frames(39) == 39
+    assert _av.align_guide_frames(40) == 39
+    assert _av.align_guide_frames(56) == 56
+    assert _av.align_guide_frames(100) == 90    # 90 % 17 == 5
+
+
+def test_frame_plan_with_prev():
+    """段 2+：生成长度 = 本段帧数 + N 再对齐；成片长度只算本段。"""
+    gen, valid, crop, audio_start = _av.segment_frame_plan(6.0, 39, True)
+    # 6s = 144 帧 → 对齐 17k+5 → 158；+39 = 197 → 对齐 → 209
+    assert (gen, valid, crop) == (209, 144, 39)
+    assert audio_start == pytest.approx(39 / 24.0)
+
+
+def test_frame_plan_first_segment():
+    """段 1 / 单段模式：不加前置、不裁。"""
+    gen, valid, crop, audio_start = _av.segment_frame_plan(6.0, 39, False)
+    assert (gen, valid, crop, audio_start) == (158, 144, 0, 0.0)
+
+
+def test_frame_plan_matches_removed_math_nodes():
+    """
+    这套算法是原来工作流里 4 个数学节点的等价替换，数值必须一模一样，
+    否则改完每段长度都变，成片接缝会全乱。
+
+    原式：
+      本段帧数 = max(5, round(t*24))       再对齐 17k+5
+      生成长度 = 本段帧数 + N              再对齐 17k+5
+      有效帧数 = int(t*24)
+    """
+    import math
+
+    def old_align(n):
+        return n + (5 - n % 17) % 17
+
+    for duration in (6.0, 10.0, 19.9, 19.838, 0.4):
+        for overlap in (0, 22, 39):
+            for has_prev in (True, False):
+                seg = old_align(max(5, round(duration * 24)))
+                want_gen = old_align(seg + (overlap if has_prev else 0))
+                want_valid = int(duration * 24)
+                got = _av.segment_frame_plan(duration, overlap, has_prev)
+                assert got[0] == want_gen, (duration, overlap, has_prev, got, want_gen)
+                assert got[1] == want_valid
+                assert got[2] == (overlap if has_prev else 0)
+
+
+def test_result_carries_frame_plan():
+    """帧数账本必须真的从结果里出来，下游才接得到。"""
+    node = _av.DogkingAudioSplit()
+    segs = _segments((1, 3, ""), (3, 5, ""))
+    out = _run_at(node, segs, 2, 39)
+    r = out["result"]
+    assert len(r) == 18                    # 12 固定口 + 6 参考图口
+    gen, valid, crop, audio_start, overlap, has_prev = r[6:12]
+    assert overlap == 39 and has_prev is True
+    assert crop == 39
+    assert audio_start == pytest.approx(1.625)
+    assert valid == 48                     # 2 秒 × 24
+    assert gen == 107                      # 48 → 对齐 56；56+39 = 95 → 对齐 107
+    assert r[12:] == (None,) * 6           # 没设参考图 → 6 个图片口全是 None

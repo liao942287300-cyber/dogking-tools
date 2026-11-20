@@ -139,67 +139,6 @@ def frames_to_image(frames):
     return torch.from_numpy(arr)
 
 
-def _gaussian_kernel(sigma):
-    """一维高斯核（够 3σ 就截断），归一化。"""
-    radius = max(1, int(round(3.0 * float(sigma))))
-    x = torch.arange(-radius, radius + 1, dtype=torch.float32)
-    k = torch.exp(-(x ** 2) / (2.0 * float(sigma) ** 2))
-    return k / k.sum()
-
-
-def _blur(image, sigma=1.0):
-    """
-    对 [B,H,W,3] 做可分离高斯模糊（reflect padding，边缘不压暗）。
-    """
-    if sigma <= 0:
-        return image
-    k = _gaussian_kernel(sigma)
-    radius = (k.numel() - 1) // 2
-    # [B,H,W,3] -> [B*3, 1, H, W]，逐通道卷积
-    b, h, w, c = image.shape
-    x = image.permute(0, 3, 1, 2).reshape(b * c, 1, h, w)
-
-    kx = k.view(1, 1, 1, -1).expand(1, 1, 1, k.numel())
-    ky = k.view(1, 1, -1, 1).expand(1, 1, k.numel(), 1)
-
-    x = torch.nn.functional.pad(x, (radius, radius, 0, 0), mode="reflect")
-    x = torch.nn.functional.conv2d(x, kx)
-    x = torch.nn.functional.pad(x, (0, 0, radius, radius), mode="reflect")
-    x = torch.nn.functional.conv2d(x, ky)
-    return x.reshape(b, c, h, w).permute(0, 2, 3, 1)
-
-
-def attenuate_high_freq(image, amount):
-    """
-    按比例削弱高频细节，保留低频（构图、颜色、运动、明暗）完全不变。
-
-        结果 = 低频 + (1 - amount) × 高频
-
-    amount=0 → 原样；amount=0.5 → 细节砍一半；amount=1 → 只剩低频（会糊，不建议）。
-
-    为什么需要它（实测数据）
-    ------------------------
-    分段生成的引导帧就是上一段的输出，而每个段生成时又会把高频「加锐」一层：
-    实测 6 段成片段均锐度 18.5 → 21.7 → 22.9 → 26.3 → 30.9 → 35.4，
-    相邻两段比值稳定在 1.2 左右 —— 这是正反馈：
-
-        输出 = 1.2 × 输入
-
-    只要这个增益 > 1，段数越多就越锐、越毛刺，直到过冲饱和。把引导帧的高频
-    压到 (1 - amount) 倍，环路增益变成 1.2 × (1 - amount)：amount > 0.17 时
-    增益落到 1 以下，链条就收敛了。默认 0.35，留了余量。
-
-    视觉上：段内被裁掉的 22 帧引导本来就看不见，衰减只改变「以什么质感续写」，
-    不改动作和口型。
-    """
-    a = float(amount)
-    if a <= 0:
-        return image
-    a = min(a, 0.9)
-    low = _blur(image, sigma=1.0)
-    return low + (1.0 - a) * (image - low)
-
-
 def align_guide_frames(count):
     """
     把「取末帧数」对到 H3 认的长度上：只有 17k+5（5 / 22 / 39 / 56…）。
@@ -223,12 +162,6 @@ def align_guide_frames(count):
         if valid <= n:
             best = valid
     return best
-
-
-def high_freq_energy(image):
-    """高频能量 = (图像 - 1px 模糊) 的标准差。给状态行做前后对比用。"""
-    low = _blur(image, sigma=1.0)
-    return float((image - low).std())
 
 
 def _placeholder():
@@ -306,13 +239,6 @@ class DogkingPrevSegmentFrames:
                                "单段模式是在调某一段，读到的 seg 文件是上一轮的，接上去反而错。"
                                "留 0 = 不判断",
                 }),
-                "去锐化": ("FLOAT", {
-                    "default": 0.0, "min": 0.0, "max": 0.9, "step": 0.05,
-                    "tooltip": "削弱引导帧的高频细节，用来压「越接越锐」。它对每段是"
-                               "1:1 传递的：填 0.15 段 2 就比段 1 软 15%（实测"
-                               "18.5→15.8）。所以默认 0，先用画质体检脚本确认真的在变锐"
-                               "再调，一般 0.1~0.2 就够",
-                }),
             },
         }
 
@@ -328,18 +254,17 @@ class DogkingPrevSegmentFrames:
 
     @classmethod
     def IS_CHANGED(cls, 段序号=1, 任务名="", 取末帧数=5, 片段根目录="", 缺段时="黑帧占位",
-                   段数=0, 去锐化=0.0):
+                   段数=0):
         # 片段被重写（重跑上一段）时要重算，否则会一直用旧的引导帧
         path, _kind = resolve_segment(段序号, 任务名, 片段根目录)
         try:
             stat = os.stat(path)
-            return "%s|%d|%d|%d|%.2f" % (
-                path, stat.st_mtime_ns, stat.st_size, int(段数), float(去锐化))
+            return "%s|%d|%d|%d" % (path, stat.st_mtime_ns, stat.st_size, int(段数))
         except OSError:
-            return "%s|missing|%d|%.2f" % (path or "-", int(段数), float(去锐化))
+            return "%s|missing|%d" % (path or "-", int(段数))
 
     def load_prev(self, 段序号, 任务名, 取末帧数=5, 片段根目录="", 缺段时="黑帧占位",
-                  段数=0, 去锐化=0.0):
+                  段数=0):
         idx = max(1, int(段序号))
         count = max(1, int(取末帧数))
         total = max(0, int(段数))
@@ -398,22 +323,13 @@ class DogkingPrevSegmentFrames:
         image = frames_to_image(frames)
         got = int(image.shape[0])
 
-        # 削高频：把「越接越锐」的环路增益压到 1 以下（见 attenuate_high_freq 注释）
-        sharpen_note = ""
-        if float(去锐化) > 0:
-            before = high_freq_energy(image)
-            image = attenuate_high_freq(image, 去锐化).clamp(0.0, 1.0)
-            after = high_freq_energy(image)
-            drop = (1.0 - after / max(before, 1e-9)) * 100.0
-            sharpen_note = " · 去锐化 %.2f（高频 %+.0f%%）" % (float(去锐化), -drop)
-
         note = ""
         if want != int(取末帧数):
             note = "（取末帧数 %d → 按 %d 帧，H3 只认 5/22/39…）" % (int(取末帧数), want)
         if got > 5:
             note += "· %d 帧引导（去重裁剪起点需同为 %d）" % (got, got)
-        status = "续接第 %d 段 · 取自 %s（%s）末 %d 帧%s%s" % (
-            idx, os.path.basename(path), source_kind, got, note, sharpen_note
+        status = "续接第 %d 段 · 取自 %s（%s）末 %d 帧%s" % (
+            idx, os.path.basename(path), source_kind, got, note
         )
         print("[dogking-tools] 上一段末帧：%s" % status)
         return {

@@ -72,6 +72,17 @@ _register_node_module("video_concat", "分段视频合并")
 # 上一段末帧续接（读上一段成片末 N 帧当 AddGuide 引导图）
 _register_node_module("prev_frames", "上一段末帧续接")
 
+# 受保护上下文（续接硬锁）—— 2026-11-20 停用：工作流已回到无硬锁流程。
+# 模块文件保留，需要回滚时把下面一行放开即可。
+# _register_node_module("protected_context", "受保护上下文")
+
+# 同比例定尺寸（上采样目标宽高：保持和一采同比例，32 倍数，换比例自动跟）
+_register_node_module("aspect_size", "同比例定尺寸")
+
+# 续接引导加噪 —— 2026-11-20 停用：清空所有画质补丁，引导帧原样进模型。
+# 模块文件保留，需要回滚时把下面一行放开即可。
+# _register_node_module("guide_noise", "续接引导加噪")
+
 WEB_DIRECTORY = "./web"
 
 # 注册后端接口（文件选择 / 行数预览 / 重置计数 / PromptVault 代转）

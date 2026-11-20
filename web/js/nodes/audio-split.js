@@ -37,8 +37,8 @@ const app = comfyAPI.app?.app;
 const api = comfyAPI.api?.api;
 
 const NODE_NAME = "DogkingAudioSplit";
-/** 面板高度。给波形 150 + 工具栏 + 段清单滚动区留够空间 */
-const PANEL_HEIGHT = 476;   // 进度条 + 输出状态行各占一行
+/** 面板高度。给全局参考图 + 波形 150 + 工具栏 + 段清单滚动区留够空间 */
+const PANEL_HEIGHT = 538;   // 多了一行全局提示词输入；参考图已挪到节点顶部空白区
 /** 顺序模式执行完，后端发这个事件让前端自动排下一段 */
 const EVENT_NEXT = "dogking-tools.audio.next";
 /** 最小段长（秒）。比这更短的段切出来是噪音，拖到头就当合并 */
@@ -47,6 +47,13 @@ const MIN_GAP = 0.06;
 const HIT_PX = 9;
 /** 波形高度 */
 const WAVE_H = 150;
+/**
+ * 参考图槽位数。**必须和后端 audio_split.MAX_REFS 一致** ——
+ * 后端用它决定返回几个图片口，前端用它决定画几个槽。
+ */
+const MAX_REFS = 6;
+/** 短边限制默认值，和后端 REF_SHORT_EDGE_DEFAULT 保持一致 */
+const REF_SHORT_DEFAULT = 1024;
 
 /* ==================================================================== 样式 */
 
@@ -70,6 +77,34 @@ function injectStyles() {
   color: #cfd8ea;
   font: 12px/1.4 ui-monospace, Consolas, monospace;
   user-select: none;
+}
+/* 全局提示词：原生多行 widget 藏掉之后，值从这里编辑 */
+.dk-as-global {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.dk-as-global-lbl {
+  color: #8fb4ff;
+  font-size: 11px;
+  font-weight: 600;
+}
+.dk-as .dk-as-global-input {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 34px;
+  resize: vertical;
+  padding: 5px 6px;
+  border: 1px solid rgba(120, 150, 210, 0.35);
+  border-radius: 5px;
+  background: #151a22;
+  color: #d6e0f2;
+  font: 12px/1.45 ui-monospace, Consolas, monospace;
+  outline: none;
+}
+.dk-as .dk-as-global-input:focus {
+  border-color: rgba(120, 170, 255, 0.75);
 }
 .dk-as-bar, .dk-as-exec {
   flex: 0 0 auto;
@@ -329,6 +364,157 @@ function injectStyles() {
   color: #6c778a;
   text-align: center;
 }
+
+/* ---------------- 参考图 ---------------- */
+
+.dk-as-refs {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 5px 6px 6px;
+  border-radius: 6px;
+  background: rgba(90, 130, 220, 0.07);
+  border: 1px solid rgba(120, 150, 210, 0.22);
+}
+.dk-as-refs-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  row-gap: 3px;
+}
+.dk-as-refs-title { color: #8fb4ff; font-weight: 600; }
+.dk-as-refs-count { color: #7f8ea8; font-size: 11px; }
+.dk-as-refs-gap { flex: 1 1 auto; min-width: 4px; }
+.dk-as-refs-unit { color: #7f8ea8; font-size: 11px; }
+.dk-as .dk-as-refs-short {
+  flex: 0 0 auto;
+  width: 58px;
+  padding: 1px 4px;
+  border: 1px solid rgba(140, 170, 255, 0.35);
+  border-radius: 5px;
+  background: rgba(0, 0, 0, 0.35);
+  color: #cfd8ea;
+  font: inherit;
+  font-size: 11px;
+  text-align: right;
+}
+.dk-as-refs-grid {
+  display: flex;
+  gap: 5px;
+  flex-wrap: nowrap;
+}
+.dk-as-ref-slot {
+  position: relative;
+  flex: 0 0 auto;
+  width: 56px;
+  height: 56px;
+  border-radius: 5px;
+  border: 1px dashed rgba(140, 170, 255, 0.32);
+  background: rgba(0, 0, 0, 0.28);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  overflow: hidden;
+}
+.dk-as-ref-slot:hover {
+  border-color: rgba(140, 180, 255, 0.78);
+  background: rgba(90, 120, 200, 0.18);
+}
+.dk-as-ref-slot--has {
+  border-style: solid;
+  border-color: rgba(120, 170, 255, 0.55);
+}
+.dk-as-ref-slot img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.dk-as-ref-plus { color: #5c7099; font-size: 18px; line-height: 1; }
+/* 删除按钮要压过通用按钮样式，所以多一层选择器 */
+.dk-as .dk-as-ref-del {
+  position: absolute;
+  top: 1px;
+  right: 1px;
+  width: 15px;
+  height: 15px;
+  min-width: 0;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: rgba(10, 14, 22, 0.82);
+  color: #ff9a9a;
+  font-size: 11px;
+  line-height: 15px;
+  text-align: center;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 90ms;
+}
+.dk-as-ref-slot:hover .dk-as-ref-del { opacity: 1; }
+.dk-as .dk-as-ref-del:hover { background: rgba(60, 16, 16, 0.92); color: #ff6b6b; }
+.dk-as-ref-tag {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 0 3px;
+  font-size: 9px;
+  line-height: 12px;
+  color: #cfe0ff;
+  background: rgba(10, 14, 22, 0.72);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 段行里的「图 N」按钮 */
+.dk-as .dk-as-refbtn {
+  flex: 0 0 auto;
+  min-width: 32px;
+  padding: 1px 5px;
+  font-size: 11px;
+  color: #7c8aa4;
+  border-color: rgba(140, 170, 255, 0.22);
+  background: rgba(90, 120, 200, 0.08);
+}
+.dk-as .dk-as-refbtn:hover { color: #cfe0ff; }
+.dk-as .dk-as-refbtn--on {
+  color: #6fd8c2;
+  border-color: rgba(63, 211, 154, 0.55);
+  background: rgba(35, 160, 115, 0.2);
+}
+
+/* 展开后的段内参考图子行 */
+.dk-as-refsub {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 1px 0 6px 26px;
+  padding: 5px 6px;
+  border-radius: 5px;
+  border: 1px solid rgba(120, 170, 255, 0.22);
+  background: rgba(90, 130, 220, 0.08);
+}
+.dk-as-refsub-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.dk-as-refsub-note {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: #8b98ae;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.dk-as-refs-grid--small .dk-as-ref-slot { width: 42px; height: 42px; }
+.dk-as-refs-grid--small .dk-as-ref-plus { font-size: 15px; }
 `;
   document.head.appendChild(style);
 }
@@ -367,10 +553,74 @@ function readSegments(raw) {
     const start = Number(item.start);
     const end = Number(item.end);
     if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) continue;
-    out.push({ start: Math.max(0, start), end, prompt: String(item.prompt || "") });
+    // 每段的自定义参考图。空数组 / 缺字段 = 沿用全局，所以统一成数组再往下传。
+    out.push({
+      start: Math.max(0, start),
+      end,
+      prompt: String(item.prompt || ""),
+      images: cleanPaths(item.images),
+    });
   }
   out.sort((a, b) => a.start - b.start);
   return out;
+}
+
+/** 路径数组清洗：去掉空串和重复项，最多留 MAX_REFS 个 */
+function cleanPaths(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const item of raw) {
+    const text = String(item ?? "").trim();
+    if (text && !out.includes(text)) out.push(text);
+  }
+  return out.slice(0, MAX_REFS);
+}
+
+/**
+ * 读「参考图数据」：`{short: 1024, images: [路径…]}`。
+ *
+ * 容错优先 —— 老工作流里这个字段根本不存在，面板也得正常打开。
+ */
+function readRefConfig(raw) {
+  let data = raw;
+  if (typeof raw === "string") {
+    try {
+      data = JSON.parse(raw || "{}");
+    } catch (err) {
+      data = {};
+    }
+  }
+  if (!data || typeof data !== "object" || Array.isArray(data)) data = {};
+  const short = Math.round(Number(data.short));
+  return {
+    short: Number.isFinite(short) && short >= 0 ? short : REF_SHORT_DEFAULT,
+    images: cleanPaths(data.images),
+  };
+}
+
+/** 参考图缩略图地址（走后端代理；本机绝对路径浏览器读不到） */
+function refThumbUrl(path) {
+  const base = `/dogking-tools/image_file?thumb=1&path=${encodeURIComponent(path)}`;
+  // ComfyUI 可能挂在子路径下，和试听音频一样过一遍 apiURL
+  return typeof api?.apiURL === "function" ? api.apiURL(base) : base;
+}
+
+/** 取文件名（路径可能带 / 也可能带 \） */
+function baseName(path) {
+  const text = String(path || "");
+  const cut = Math.max(text.lastIndexOf("/"), text.lastIndexOf("\\"));
+  return cut >= 0 ? text.slice(cut + 1) : text;
+}
+
+/** 往数组里并入路径：去重，最多 MAX_REFS 个 */
+function mergePaths(target, extra) {
+  for (const item of extra || []) {
+    const text = String(item ?? "").trim();
+    if (!text || target.includes(text)) continue;
+    if (target.length >= MAX_REFS) break;
+    target.push(text);
+  }
+  return target;
 }
 
 /** 从同一份 JSON 里读选区；没有 / 坏掉返回 null（调用方退回 0~总长） */
@@ -416,6 +666,11 @@ class AudioSplitPanel {
     this.audioEl = new Audio();
     this.playing = -1;      // 正在试听第几段（-1 = 没在放）
 
+    // 参考图：全局 6 张 + 每段的独立 6 张（段内有图就整组覆盖全局）
+    this.globalRefs = [];
+    this.refShort = REF_SHORT_DEFAULT;
+    this.refOpen = -1;      // 展开了参考图子行的段下标（-1 = 都没展开）
+
     this.build();
     this.bindAudio();
     this.restore();
@@ -431,6 +686,25 @@ class AudioSplitPanel {
       return n;
     };
     this.el = el("div", "dk-as");
+
+    /* 全局参考图不在这里 —— 它画在节点顶部的空白区（见 drawRefsPanel）。
+       那块空白是 18 个输出口把 widget 区起点推下去造成的，DOM widget 挪不上去：
+       容器的 top 由 litegraph 控制、改了就跑到节点外面。节点自己的画布不受这个
+       限制，而那一片本来就什么都没有，正好拿来放图。 */
+
+    /* 全局提示词：原本是节点上的多行 widget，它占掉顶部空白区下半截，
+       把参考图第 3 行挡得看不见。挪进面板之后那块空白就整块归参考图。 */
+    const gp = el("div", "dk-as-global");
+    gp.appendChild(el("span", "dk-as-global-lbl", "全局提示词"));
+    this.globalPromptEl = el("textarea", "dk-as-global-input");
+    this.globalPromptEl.rows = 2;
+    this.globalPromptEl.placeholder = "所有段共用；某段自己写了就以那段的为准";
+    this.globalPromptEl.addEventListener("pointerdown", (e) => e.stopPropagation());
+    this.globalPromptEl.addEventListener("keydown", (e) => e.stopPropagation());
+    this.globalPromptEl.addEventListener("input", () => {
+      this.writeWidget("全局提示词", this.globalPromptEl.value);
+    });
+    gp.appendChild(this.globalPromptEl);
 
     /* 工具栏 */
     const bar = el("div", "dk-as-bar");
@@ -501,7 +775,7 @@ class AudioSplitPanel {
     /* 段清单 */
     this.listEl = el("div", "dk-as-list");
 
-    this.el.append(bar, wrap, prog, exec, this.flashEl, tools, this.listEl);
+    this.el.append(gp, bar, wrap, prog, exec, this.flashEl, tools, this.listEl);
     this.mount.appendChild(this.el);
 
     /* 事件（全部隔离，别让画布跟着动） */
@@ -529,6 +803,11 @@ class AudioSplitPanel {
     });
 
     this.bindCanvas();
+
+    /* 6 个全局参考图槽画在节点顶部那块空白里（不是面板内部）。
+       挂上去之后节点每次重绘都会带上，面板高度因此不用再留这 96px。 */
+    this.bindNodeCanvas();
+    this.renderRefs();
 
     /* 画布尺寸跟着容器走 */
     this.ro = new ResizeObserver(() => this.resize());
@@ -913,8 +1192,11 @@ class AudioSplitPanel {
       const start = Math.max(lo, Math.min(Number(raw.start) || 0, hi));
       const end = Math.max(start, Math.min(Number(raw.end) || 0, hi));
       const prompt = String(raw.prompt || "");
+      // 每段的参考图必须跟着段一起搬 —— 这里整表重建，漏一个字段就等于
+      // 用户配好的图被「改一下提示词」顺手清空了
+      const images = cleanPaths(raw.images);
       if (!out.length) {
-        if (end - start >= MIN_GAP) out.push({ start, end, prompt });
+        if (end - start >= MIN_GAP) out.push({ start, end, prompt, images });
         continue;
       }
       const prev = out[out.length - 1];
@@ -923,8 +1205,10 @@ class AudioSplitPanel {
       if (end - st <= MIN_GAP + 1e-6) {
         prev.end = Math.max(prev.end, end);       // 碎段（含正好 0.06 秒的）并进前一段
         if (!prev.prompt) prev.prompt = prompt;
+        // 碎段自己的参考图一起带过去（前一段有图就以它为准）
+        if (!prev.images.length && images.length) prev.images = images;
       } else {
-        out.push({ start: st, end, prompt });
+        out.push({ start: st, end, prompt, images });
       }
     }
     if (!out.length) return;
@@ -944,7 +1228,9 @@ class AudioSplitPanel {
       return;
     }
     const seg = this.segments[idx];
-    const right = { start: t, end: seg.end, prompt: "" };
+    // 切开后新出现的右半段不继承参考图：本段的图是配给「这一段画面」的，
+    // 复制到两段等于凭空多出一段用同一批参考的画面，用户得自己删一半
+    const right = { start: t, end: seg.end, prompt: "", images: [] };
     seg.end = t;
     this.segments.splice(idx + 1, 0, right);
     this.cursor = t;
@@ -969,7 +1255,7 @@ class AudioSplitPanel {
       // 先有选区：没有分段时按选区建一段，再切
       const r = this.range;
       const seg = r.end - r.start >= MIN_GAP ? { start: r.start, end: r.end } : { start: 0, end: this.duration };
-      this.segments = [{ ...seg, prompt: "" }];
+      this.segments = [{ ...seg, prompt: "", images: [] }];
       this.syncRange();
       this.commit();
       this.renderList();
@@ -996,13 +1282,14 @@ class AudioSplitPanel {
       const start = from + i * step;
       const end = Math.min(to, from + (i + 1) * step);
       if (end - start < MIN_GAP) continue;
-      segments.push({ start, end, prompt: "" });
+      segments.push({ start, end, prompt: "", images: [] });
     }
     // 尾巴太短就并进前一段，别留下 0.05 秒的空壳
     const last = segments[segments.length - 1];
     if (last && to - last.end > 1e-6 && to - last.end <= MIN_GAP) last.end = to;
     this.segments = segments;
     this.active = 0;
+    this.refOpen = -1;
     this.syncActiveWidget();
     this.commit();
     this.renderList();
@@ -1013,6 +1300,7 @@ class AudioSplitPanel {
     // 只清分段，选区保留 —— 用户裁好的头尾不该被「清空分段」一起抹掉
     this.segments = [];
     this.active = 0;
+    this.refOpen = -1;
     this.syncActiveWidget();
     this.updateRangeLabel();
     this.commit();
@@ -1045,6 +1333,7 @@ class AudioSplitPanel {
     }
     this.segments.splice(index, 1);
     this.active = Math.min(this.active, this.segments.length - 1);
+    this.refOpen = -1;          // 段号全往前挪了一位，展开面板会指错段
     this.syncActiveWidget();
     this.commit();
     this.renderList();
@@ -1061,6 +1350,471 @@ class AudioSplitPanel {
   }
 
   /* ---------------- 音频 ---------------- */
+
+  /* ---------------- 参考图 ---------------- */
+
+  /**
+   * 画一组参考图槽位（固定 MAX_REFS 个）。
+   *
+   * 为什么固定画满 6 个而不是只画已有的：空槽就是「还能再加」的入口，
+   * 用户不用先找「添加」按钮再理解它加在哪儿 —— 点哪个空位就填哪个。
+   */
+  buildRefGrid(paths, opts) {
+    const grid = document.createElement("div");
+    grid.className = "dk-as-refs-grid" + (opts.small ? " dk-as-refs-grid--small" : "");
+    for (let i = 0; i < MAX_REFS; i += 1) {
+      grid.appendChild(this.makeRefSlot(paths[i], i, opts));
+    }
+    return grid;
+  }
+
+  makeRefSlot(path, index, opts) {
+    const slot = document.createElement("div");
+    slot.className = "dk-as-ref-slot" + (path ? " dk-as-ref-slot--has" : "");
+    slot.title = path ? `${path}\n点一下换掉这张` : "点一下选图（可一次多选）";
+
+    if (path) {
+      const img = document.createElement("img");
+      img.src = refThumbUrl(path);
+      img.draggable = false;
+      img.alt = "";
+      // 缩略图生成失败（文件被删 / 格式怪）时退回一个占位，不要把槽位留空
+      img.addEventListener("error", () => {
+        img.remove();
+        const mark = document.createElement("span");
+        mark.className = "dk-as-ref-plus";
+        mark.textContent = "?";
+        slot.appendChild(mark);
+      });
+      slot.appendChild(img);
+
+      const tag = document.createElement("span");
+      tag.className = "dk-as-ref-tag";
+      tag.textContent = baseName(path);
+      slot.appendChild(tag);
+
+      const del = document.createElement("button");
+      del.className = "dk-as-ref-del";
+      del.textContent = "×";
+      del.title = "移除这张参考图";
+      del.addEventListener("pointerdown", (e) => e.stopPropagation());
+      del.addEventListener("click", (e) => {
+        e.stopPropagation();
+        opts.onClear(index);
+      });
+      slot.appendChild(del);
+    } else {
+      const plus = document.createElement("span");
+      plus.className = "dk-as-ref-plus";
+      plus.textContent = "＋";
+      slot.appendChild(plus);
+    }
+
+    slot.addEventListener("pointerdown", (e) => e.stopPropagation());
+    slot.addEventListener("click", (e) => {
+      e.stopPropagation();
+      opts.onPick(index);
+    });
+    return slot;
+  }
+
+  /* ---------------- 全局参考图（画在节点顶部空白区） ---------------- */
+
+  /**
+   * 6 个全局参考图槽位画在哪儿。
+   *
+   * 那块空白不是排版失误：litegraph 的 widget 区起点 = 标题高 +
+   * max(输入口高, 输出口高)。这节点有 18 个输出口，右侧占掉约 360px，
+   * 左边同高的一段就没有任何 widget 覆盖。
+   *
+   * DOM widget 挪不进去 —— 容器是绝对定位的，top 由 litegraph 每帧写死，
+   * 改 top / margin / transform 都会让面板跑到节点外面。而节点自己的
+   * canvas 在这一层没有限制，那一片本来就是空的，直接画就行。
+   */
+  /**
+   * 面板 DOM 顶边落在节点坐标的哪儿。
+   *
+   * 不能用 widget.y / last_y —— 隐藏掉「全局提示词」之后，litegraph 没有把
+   * 后面 widget 的 y 往下重算，报出来的 544 比实际位置大 170 像素，
+   * 照着画会把下面一两行槽位画到面板底下。直接量 DOM 最准。
+   */
+  panelTopNode() {
+    const app = globalThis.comfyAPI?.app?.app;
+    const cvs = app?.canvas?.canvas;
+    const ds = app?.canvas?.ds;
+    const el = this.el;
+    if (!cvs || !ds || !el || !el.isConnected || !ds.scale) return null;
+    const r = el.getBoundingClientRect();
+    if (!r.height) return null;
+    const cr = cvs.getBoundingClientRect();
+    // 屏幕 = (画布坐标 + offset) * scale，反解出画布坐标后减去节点 pos，
+    // 才是 onDrawForeground 里那套「节点内坐标」
+    const canvasY = (r.top - cr.top) / ds.scale - ds.offset[1];
+    return canvasY - (this.node?.pos?.[1] ?? 0);
+  }
+
+  refGeometry() {
+    const node = this.node;
+    if (!node) return null;
+    // 格子区下界 = **第一行控件（输出模式）的顶上**，不是 DOM 面板的顶。
+    // 控件行（输出模式~续接帧数）画在 [widgets_start_y, 面板顶] 这一段里，
+    // 之前量面板顶，格子伸下去正好压在控件行上 —— 这就是「超边界」的来源。
+    // litegraph 每帧布局时算好这个值，输入/输出口再多它也是对的。
+    let bottom = Number(node.widgets_start_y);
+    if (!Number.isFinite(bottom) || bottom < 120) {
+      const first = (node.widgets || []).find((w) => w.name === "输出模式");
+      bottom = Number(first?.last_y ?? first?.y);
+    }
+    if (!Number.isFinite(bottom) || bottom < 120) return null;
+
+    const TITLE = globalThis.LiteGraph?.NODE_TITLE_HEIGHT ?? 30;
+    const W = node.size[0];
+    const pad = 10;
+    const rightPad = 132;                 // 右侧那排输出口标签要占的宽度
+    const cols = 3;
+    const rows = 2;
+    const gapX = 8;
+    const gapY = 8;
+    // 格子只大到「能看清缩略图」为止：节点拉得再宽再高，格子也不跟着膨胀，
+    // 多出来的空间用横向/纵向居中消化掉 —— 不然随手一拉节点，格子就变成海报墙。
+    const MAX_CELL_W = 200;
+    const MAX_CELL_H = 150;
+    const availW = W - rightPad - pad * 2 - gapX * (cols - 1);
+    const cellW = Math.max(60, Math.min(MAX_CELL_W, availW / cols));
+    const headH = 34;                     // 顶上那行「全局参考图 / 短边」
+    const usable = bottom - (TITLE + headH) - 6;
+    const cellH = Math.max(
+      40,
+      Math.min(
+        cellW * 0.78,                     // 上限取 4:3 而不是 16:9：素材多是竖版人像，格子高一点反而裁得少
+        (usable - gapY * (rows - 1)) / rows,
+        MAX_CELL_H,
+      ),
+    );
+    // 格子组整体**顶格往上贴**：紧挨「音频」输入口下面开始，多出来的高度
+    // 全部留在格子底下 —— 别居中，居中会让格子下坠、底边贴到「输出模式」
+    const gridW = cellW * cols + gapX * (cols - 1);
+    const x0 = pad + Math.max(0, (W - rightPad - pad * 2 - gridW) / 2);
+    const top = TITLE + headH;
+    return { TITLE, bottom, W, pad, rightPad, cols, rows, gapX, gapY, cellW, cellH, top, x0 };
+  }
+
+  refSlotRect(i) {
+    const g = this.refGeometry();
+    if (!g) return null;
+    return {
+      x: g.x0 + (i % g.cols) * (g.cellW + g.gapX),
+      y: g.top + Math.floor(i / g.cols) * (g.cellH + g.gapY),
+      w: g.cellW,
+      h: g.cellH,
+    };
+  }
+
+  refShortRect() {
+    const g = this.refGeometry();
+    if (!g) return null;
+    const w = 104;
+    const h = 18;
+    return { x: g.W - g.rightPad - g.pad - w, y: g.top - 24, w, h };
+  }
+
+  /** 缩略图对象：同一路径只 new 一次，加载完主动重绘一次 */
+  refImage(path) {
+    if (!this._refImgs) this._refImgs = new Map();
+    const hit = this._refImgs.get(path);
+    if (hit) return hit;
+    const rec = { img: new Image(), ready: false };
+    rec.img.onload = () => {
+      rec.ready = true;
+      this.refreshCanvas();
+    };
+    rec.img.onerror = () => {
+      rec.ready = false;
+      this.refreshCanvas();
+    };
+    rec.img.src = refThumbUrl(path);
+    this._refImgs.set(path, rec);
+    return rec;
+  }
+
+  refreshCanvas() {
+    this.node?.setDirtyCanvas?.(true, true);
+  }
+
+  /** 每帧由节点的 onDrawForeground 调用 */
+  drawRefsPanel(ctx) {
+    const g = this.refGeometry();
+    if (!g) return;
+
+    ctx.save();
+    ctx.textAlign = "left";
+    ctx.textBaseline = "alphabetic";
+
+    // 标题行
+    ctx.fillStyle = "rgba(160,190,235,0.95)";
+    ctx.font = "bold 11px ui-monospace, Consolas, monospace";
+    ctx.fillText("全局参考图", g.pad, g.top - 8);
+    const tw = ctx.measureText("全局参考图").width;
+    ctx.fillStyle = "rgba(120,140,175,0.9)";
+    ctx.font = "10px ui-monospace, Consolas, monospace";
+    ctx.fillText(`${this.globalRefs.length}/${MAX_REFS}`, g.pad + tw + 8, g.top - 8);
+
+    // 短边（点一下弹输入）
+    const sr = this.refShortRect();
+    if (sr) {
+      ctx.fillStyle = "rgba(120,140,175,0.9)";
+      ctx.textAlign = "right";
+      ctx.fillText(`短边 ${this.refShort} px`, sr.x + sr.w, g.top - 8);
+      ctx.textAlign = "left";
+    }
+
+    for (let i = 0; i < MAX_REFS; i += 1) {
+      const r = this.refSlotRect(i);
+      if (!r || r.y + r.h > g.bottom - 4) break;
+      const path = this.globalRefs[i];
+
+      ctx.beginPath();
+      if (ctx.roundRect) ctx.roundRect(r.x, r.y, r.w, r.h, 6);
+      else ctx.rect(r.x, r.y, r.w, r.h);
+
+      if (path) {
+        const rec = this.refImage(path);
+        ctx.save();
+        ctx.clip();
+        ctx.fillStyle = "rgba(30,36,48,1)";
+        ctx.fillRect(r.x, r.y, r.w, r.h);
+        if (rec.ready && rec.img.naturalWidth) {
+          // cover：铺满整格，多出来的居中裁掉
+          const ir = rec.img.naturalWidth / rec.img.naturalHeight;
+          const cr = r.w / r.h;
+          let sw = rec.img.naturalWidth;
+          let sh = rec.img.naturalHeight;
+          if (ir > cr) sw = sh * cr;
+          else sh = sw / cr;
+          ctx.drawImage(
+            rec.img,
+            (rec.img.naturalWidth - sw) / 2,
+            (rec.img.naturalHeight - sh) / 2,
+            sw, sh,
+            r.x, r.y, r.w, r.h,
+          );
+        }
+        ctx.restore();
+
+        // 左上角序号
+        ctx.fillStyle = "rgba(0,0,0,0.55)";
+        ctx.beginPath();
+        if (ctx.roundRect) ctx.roundRect(r.x + 5, r.y + 5, 20, 16, 4);
+        else ctx.rect(r.x + 5, r.y + 5, 20, 16);
+        ctx.fill();
+        ctx.fillStyle = "rgba(220,235,255,0.95)";
+        ctx.font = "10px ui-monospace, Consolas, monospace";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(String(i + 1), r.x + 15, r.y + 13);
+
+        // 右上角删除
+        ctx.fillStyle = "rgba(0,0,0,0.55)";
+        ctx.beginPath();
+        if (ctx.roundRect) ctx.roundRect(r.x + r.w - 22, r.y + 5, 17, 17, 4);
+        else ctx.rect(r.x + r.w - 22, r.y + 5, 17, 17);
+        ctx.fill();
+        ctx.fillStyle = "rgba(255,190,190,0.95)";
+        ctx.font = "bold 12px ui-monospace, Consolas, monospace";
+        ctx.fillText("×", r.x + r.w - 13.5, r.y + 14);
+
+        ctx.textAlign = "left";
+        ctx.textBaseline = "alphabetic";
+      } else {
+        ctx.fillStyle = "rgba(90,130,220,0.10)";
+        ctx.fill();
+        ctx.strokeStyle = "rgba(120,150,210,0.45)";
+        ctx.lineWidth = 1;
+        ctx.setLineDash([5, 4]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        ctx.fillStyle = "rgba(140,168,210,0.75)";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.font = "14px ui-monospace, Consolas, monospace";
+        ctx.fillText("＋", r.x + r.w / 2, r.y + r.h / 2 - 8);
+        ctx.font = "10px ui-monospace, Consolas, monospace";
+        ctx.fillText(`图${i + 1}`, r.x + r.w / 2, r.y + r.h / 2 + 12);
+        ctx.textAlign = "left";
+        ctx.textBaseline = "alphabetic";
+      }
+    }
+
+    ctx.restore();
+  }
+
+  /** 命中测试：节点内坐标 -> 点到了什么 */
+  hitRef(pos) {
+    const g = this.refGeometry();
+    if (!g || !pos) return null;
+    if (pos[1] <= g.TITLE || pos[1] >= g.bottom) return null;
+
+    const sr = this.refShortRect();
+    if (sr && pos[0] >= sr.x && pos[0] <= sr.x + sr.w &&
+        pos[1] >= sr.y - 2 && pos[1] <= sr.y + sr.h) {
+      return { kind: "short" };
+    }
+
+    for (let i = 0; i < MAX_REFS; i += 1) {
+      const r = this.refSlotRect(i);
+      if (!r || r.y + r.h > g.bottom - 4) break;
+      if (pos[0] < r.x || pos[0] > r.x + r.w || pos[1] < r.y || pos[1] > r.y + r.h) {
+        continue;
+      }
+      if (this.globalRefs[i]) {
+        const dx = r.x + r.w - 22;
+        const dy = r.y + 5;
+        if (pos[0] >= dx && pos[0] <= dx + 17 && pos[1] >= dy && pos[1] <= dy + 17) {
+          return { kind: "clear", index: i };
+        }
+        return { kind: "replace", index: i };
+      }
+      return { kind: "add", index: i };
+    }
+    return null;
+  }
+
+  onRefClick(hit) {
+    if (!hit) return;
+    if (hit.kind === "short") {
+      const v = window.prompt(
+        "短边限制（像素）：短边缩到这个值、长边等比，不裁切不补边；0 = 原图",
+        String(this.refShort || REF_SHORT_DEFAULT),
+      );
+      if (v === null) return;
+      const n = Math.round(Number(v));
+      if (!Number.isFinite(n)) return;
+      this.refShort = Math.max(0, Math.min(n, 8192));
+      this.commitRefs();
+      this.refreshCanvas();
+      return;
+    }
+    if (hit.kind === "clear") {
+      this.globalRefs.splice(hit.index, 1);
+      this.commitRefs();
+      this.refreshCanvas();
+      this.renderList();          // 段行里的「沿用全局 N 张」要跟着变
+      return;
+    }
+    this.pickGlobalRefs(hit.index);
+  }
+
+  /** 把画布层挂到节点上（只挂一次） */
+  bindNodeCanvas() {
+    const node = this.node;
+    if (!node || node.__dkRefCanvas) return;
+    node.__dkRefCanvas = true;
+
+    const prevFg = node.onDrawForeground;
+    node.onDrawForeground = function (ctx) {
+      // 原生绘制可能改过变换矩阵，包起来再画自己的，免得坐标被带偏
+      ctx.save();
+      if (prevFg) prevFg.apply(this, arguments);
+      ctx.restore();
+      this.dkAudio?.drawRefsPanel(ctx);
+    };
+
+    const prevDown = node.onMouseDown;
+    node.onMouseDown = function (e, localPos) {
+      const hit = this.dkAudio?.hitRef(localPos);
+      if (hit) {
+        this.dkAudio.onRefClick(hit);
+        return true;
+      }
+      return prevDown ? prevDown.apply(this, arguments) : false;
+    };
+  }
+
+  renderRefs() {
+    this.refreshCanvas();
+  }
+
+  /** 全局参考图：点空槽补图，点已有槽换那一张 */
+  async pickGlobalRefs(index) {
+    const replacing = Boolean(this.globalRefs[index]);
+    const room = MAX_REFS - this.globalRefs.length + (replacing ? 1 : 0);
+    const paths = await this.askImages(Math.max(1, room));
+    if (!paths.length) return;
+
+    if (replacing) {
+      this.globalRefs[index] = paths[0];
+      mergePaths(this.globalRefs, paths.slice(1));
+    } else {
+      mergePaths(this.globalRefs, paths);
+    }
+    this.commitRefs();
+    this.renderRefs();
+    this.flash(`全局参考图 ${this.globalRefs.length}/${MAX_REFS} 张`);
+  }
+
+  /** 段内参考图：点空槽补图，点已有槽换那一张 */
+  async pickSegRefs(segIndex, slot) {
+    const seg = this.segments[segIndex];
+    if (!seg) return;
+    if (!Array.isArray(seg.images)) seg.images = [];
+
+    const replacing = Boolean(seg.images[slot]);
+    const room = MAX_REFS - seg.images.length + (replacing ? 1 : 0);
+    const paths = await this.askImages(Math.max(1, room));
+    if (!paths.length) return;
+
+    if (replacing) {
+      seg.images[slot] = paths[0];
+      mergePaths(seg.images, paths.slice(1));
+    } else {
+      mergePaths(seg.images, paths);
+    }
+    this.commit();
+    this.renderList();
+    this.flash(`第 ${segIndex + 1} 段参考图 ${seg.images.length} 张（覆盖全局）`);
+  }
+
+  /** 弹多选对话框。失败 / 取消都返回空数组，调用方不用管错误分支 */
+  async askImages(max) {
+    try {
+      const res = await api.fetchApi("/dogking-tools/select_images", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ max }),
+      });
+      const data = await res.json();
+      if (data?.error) {
+        this.flash(data.error);
+        return [];
+      }
+      return cleanPaths(data?.paths);
+    } catch (err) {
+      this.flash("选择参考图失败：" + err);
+      return [];
+    }
+  }
+
+  /** 只写「参考图数据」这一个 widget */
+  commitRefs() {
+    this.writeWidget("参考图数据", JSON.stringify({
+      short: Number(this.refShort) || 0,
+      images: this.globalRefs.slice(0, MAX_REFS),
+    }));
+  }
+
+  /**
+   * 当前界面这一套参数的「项目指纹」：`音频文件名|段数`。
+   *
+   * 必须和后端 `execution_signature()` 算出完全一样的串 —— 所以只取文件名和段数，
+   * **不带浮点时间**：Python 的 `%.3f` 和 JS 的 `toFixed` 在 x.xxx5 这种边界上
+   * 会差一位，那会让自动连续永远对不上、永远排不上队。
+   */
+  executionSignature() {
+    const path = String(this.readWidget("文件路径") || "").trim().replace(/^"+|"+$/g, "");
+    const base = path ? path.split(/[\\/]/).pop() : "";
+    return `${base}|${this.segments.length}`;
+  }
 
   async pickAudio() {
     try {
@@ -1611,6 +2365,7 @@ class AudioSplitPanel {
     }
 
     this.segments.forEach((seg, i) => {
+      if (!Array.isArray(seg.images)) seg.images = [];
       const row = document.createElement("div");
       const isPlaying = i === this.playing;
       const isActive = i === this.active;
@@ -1662,12 +2417,77 @@ class AudioSplitPanel {
       del.title = "删除这一段（并入相邻段）";
       del.addEventListener("click", () => this.removeSegment(i));
 
-      row.append(idx, time, durEl, input, del);
+      // 本段参考图：有图就显示张数并标绿（此时整组覆盖全局），没图显示「＋图」
+      const refBtn = document.createElement("button");
+      refBtn.className = "dk-as-refbtn" + (seg.images.length ? " dk-as-refbtn--on" : "");
+      refBtn.textContent = seg.images.length ? `图${seg.images.length}` : "＋图";
+      refBtn.title = seg.images.length
+        ? `本段用自己这 ${seg.images.length} 张参考图（整组覆盖全局）。点一下管理`
+        : "给这一段单独指定参考图；不设就沿用全局";
+      refBtn.addEventListener("pointerdown", (e) => e.stopPropagation());
+      refBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this.refOpen = this.refOpen === i ? -1 : i;
+        this.renderList();
+      });
+
+      row.append(idx, time, durEl, input, refBtn, del);
       this.listEl.appendChild(row);
       this.rows.push({ row, idx, time });
+
+      if (this.refOpen === i) {
+        this.listEl.appendChild(this.buildSegRefRow(i, seg));
+      }
     });
     this.paintTicks();
     this.updateExecInfo();
+  }
+
+  /**
+   * 段内参考图子行：展开在所属段行下面。
+   *
+   * 单独一行而不是塞进段行里：段行本来就挤（编号/时间/时长/提示词/图/删除），
+   * 再塞 6 个 42px 的缩略图会把提示词框压没。
+   */
+  buildSegRefRow(index, seg) {
+    const wrap = document.createElement("div");
+    wrap.className = "dk-as-refsub";
+
+    const head = document.createElement("div");
+    head.className = "dk-as-refsub-head";
+
+    const note = document.createElement("span");
+    note.className = "dk-as-refsub-note";
+    note.textContent = seg.images.length
+      ? `本段 ${seg.images.length} 张，整组覆盖全局（全局那 ${this.globalRefs.length} 张不参与）`
+      : "本段没设 → 沿用全局参考图";
+    head.appendChild(note);
+
+    if (seg.images.length) {
+      const clear = document.createElement("button");
+      clear.textContent = "清空本段";
+      clear.title = "清掉本段的图，回到沿用全局";
+      clear.addEventListener("pointerdown", (e) => e.stopPropagation());
+      clear.addEventListener("click", (e) => {
+        e.stopPropagation();
+        seg.images = [];
+        this.commit();
+        this.renderList();
+      });
+      head.appendChild(clear);
+    }
+
+    wrap.appendChild(head);
+    wrap.appendChild(this.buildRefGrid(seg.images, {
+      small: true,
+      onPick: (slot) => this.pickSegRefs(index, slot),
+      onClear: (slot) => {
+        seg.images.splice(slot, 1);
+        this.commit();
+        this.renderList();
+      },
+    }));
+    return wrap;
   }
 
   /** 只改选中/试听高亮，不重建 DOM —— 重建会把用户正在输入的提示词冲掉 */
@@ -1719,11 +2539,18 @@ class AudioSplitPanel {
     const data = {
       // 选区单独存一份：清空分段后它还在，重新等分时继续用
       range: { start: Number(this.range.start.toFixed(3)), end: Number(this.range.end.toFixed(3)) },
-      segments: this.segments.map((s) => ({
-        start: Number(s.start.toFixed(3)),
-        end: Number(s.end.toFixed(3)),
-        prompt: String(s.prompt || ""),
-      })),
+      segments: this.segments.map((s) => {
+        const item = {
+          start: Number(s.start.toFixed(3)),
+          end: Number(s.end.toFixed(3)),
+          prompt: String(s.prompt || ""),
+        };
+        // 空数组不写进 JSON：没有自定义图的段占绝大多数，全写成 "images":[]
+        // 只是把整张表撑大一截，老版本节点读到这个字段也当没看见
+        const images = cleanPaths(s.images);
+        if (images.length) item.images = images;
+        return item;
+      }),
     };
     this.writeWidget("分段数据", JSON.stringify(data));
   }
@@ -1737,6 +2564,19 @@ class AudioSplitPanel {
     } else if (this.segments.length) {
       this.range = { start: this.segments[0].start, end: this.segments[this.segments.length - 1].end };
     }
+
+    // 全局参考图 + 短边限制。老工作流没这个字段时读出来是「0 张 + 1024」，
+    // 面板照常打开、只是没有图。
+    const refCfg = readRefConfig(this.readWidget("参考图数据"));
+    this.globalRefs = refCfg.images;
+    this.refShort = refCfg.short;
+    this.refOpen = -1;
+
+    // 全局提示词：原生 widget 已经藏起来了，值从这儿搬到面板里那个输入框
+    if (this.globalPromptEl && document.activeElement !== this.globalPromptEl) {
+      this.globalPromptEl.value = this.readWidget("全局提示词") || "";
+    }
+
     this.normalizeSegments();
     this.updateRangeLabel();
     // 选中段必须以「当前段」widget 为准 —— 那个值才是执行时后端真正用的。
@@ -1747,6 +2587,7 @@ class AudioSplitPanel {
     this.active = Math.max(0, Math.min(this.active, this.segments.length - 1));
     this.syncActiveWidget();   // widget 存了个越界段号（改过切点/选区）就顺手夹回来
     this.updatePlayButton();
+    this.renderRefs();
     this.renderList();
     this.resize();
     if (this.readWidget("文件路径")) this.loadPeaks(false);
@@ -1790,24 +2631,45 @@ if (app && api) {
         const ret = onNodeCreated?.apply(this, arguments);
         const node = this;
 
-        // 「分段数据」是内部字段：值照常提交，但节点上不显示一行大文本框
-        const dataWidget = (node.widgets || []).find((w) => w.name === "分段数据");
-        if (dataWidget) {
-          dataWidget.type = "dogkingHidden";
-          dataWidget.computeSize = () => [0, -4];
-          dataWidget.serializeValue = () => dataWidget.value || "";
+        // 内部字段（分段数据 / 参考图数据）：值照常提交，但节点上不显示大文本框。
+        //
+        // 🔴 只改 `type` 是不够的：这两个都是 multiline STRING，ComfyUI 会按**内容长度**
+        // 算控件高度。分段表是一整串 JSON，6 段就 400 多字符，按默认宽度折行能折出
+        // 十几行 —— 节点顶部凭空多出 366px 空白，面板被挤到最底下。
+        // 三条都要给：computeSize 管老逻辑，computeLayoutSize 是 1.58 的新钩子，
+        // options.multiline 断掉「按行数算高度」这条路。
+        for (const name of ["分段数据", "参考图数据", "全局提示词"]) {
+          const w = (node.widgets || []).find((x) => x.name === name);
+          if (!w) continue;
+          w.type = "dogkingHidden";
+          if (w.options) w.options.multiline = false;
+          w.computeSize = (width) => [width || 0, 0];
+          w.computeLayoutSize = () => ({ minHeight: 0, minWidth: 0 });
+          w.serializeValue = () => w.value || "";
         }
 
         const mount = document.createElement("div");
         node.addDOMWidget("音频分段", "dkAudioSplit", mount, {
           serialize: false,
           hideOnZoom: false,
+          // 🔴 必须是常量。动态 getHeight（按节点高度补差值）会和拖拽缩放形成
+          // 反馈：拖动高度 → getHeight 变 → DOM 重排 → panelTopNode 量到过期值
+          // → onResize 的钳制把高度顶回去 → 拖拽失效、节点卡死在巨大高度。
           getHeight: () => PANEL_HEIGHT,
           getValue: () => "",
           setValue: () => {},
         });
 
         node.dkAudio = new AudioSplitPanel(node, mount);
+
+        // 缩放节点时只标脏重绘（顶部的参考图格子要按新尺寸重排）。
+        // 🔴 这里绝不能改 node.size —— 拖拽过程中 panelTopNode 量到的是上一帧
+        // 的 DOM 位置，拿它钳制高度会让「高度不跟随鼠标」。
+        const prevOnResize = node.onResize;
+        node.onResize = function () {
+          this.setDirtyCanvas?.(true, true);
+          prevOnResize?.apply(this, arguments);
+        };
 
         // 改「输出模式」/「当前段」时让面板跟上：
         // 模式影响状态行文案，当前段影响选中高亮 —— 不然要等下一次执行才刷新
@@ -1840,8 +2702,21 @@ if (app && api) {
       nodeType.prototype.onConfigure = function () {
         const r = onConfigure?.apply(this, arguments);
         const node = this;
+        // 旧工作流保存时输出口只有 12 个（那时还没有参考图）。ComfyUI 恢复是照着
+        // 存下来的 outputs 建的，不会按后端 RETURN_TYPES 自动补 —— 这里补齐，
+        // 追加在尾部所以已有连线全都不动。
+        ensureOutputs(node, nodeData);
         setTimeout(() => {
           if (node.dkAudio) node.dkAudio.restore();
+          // 面板加了参考图区、输出口多了 6 个，老工作流存的节点高度可能装不下，
+          // 内容会被裁在节点框外面。这里按实际需要补高 —— 只增不减，
+          // 免得把用户手动拉大的尺寸又缩回去。
+          try {
+            const need = node.computeSize();
+            if (need[1] > node.size[1]) node.setSize([node.size[0], need[1]]);
+          } catch (err) {
+            /* 布局算不出来就保持原样，不该因为补高度把工作流打不开 */
+          }
         }, 0);
         return r;
       };
@@ -1855,6 +2730,9 @@ if (app && api) {
         const idx = message?.dogking_index?.[0];
         if (node_has_panel(this)) {
           if (Number.isFinite(idx)) this.dkAudio.setActive(Number(idx) - 1, false);
+          // 记下这一轮真正用的参数指纹，自动连续排队前要拿它和界面比对
+          const sig = message?.dogking_sig?.[0];
+          if (typeof sig === "string") this.dkAudio.lastSig = sig;
           this.dkAudio.updateExecInfo();
         }
         this.setDirtyCanvas?.(true, true);
@@ -1866,6 +2744,32 @@ if (app && api) {
     return Boolean(node?.dkAudio);
   }
 
+  /** 按 unique_id 找节点（EVENT_NEXT 给的是节点 key，不是对象） */
+  function findNodeByKey(key) {
+    if (!key) return null;
+    const nodes = app?.graph?._nodes || app?.rootGraph?._nodes || [];
+    return nodes.find((n) => String(n.id) === String(key)) || null;
+  }
+
+  /**
+   * 按节点定义补足输出口。
+   *
+   * 为什么需要：ComfyUI 恢复工作流时用**存下来的** outputs 数组建槽位，
+   * 后端 RETURN_TYPES 后来多了 6 个图片口，老工作流不会自动多出来 ——
+   * 表现就是「后端说 18 个口，节点上只看到 12 个，图片根本接不上」。
+   * addOutput 只在尾部追加，已有连线（下标 0~11）不受影响。
+   */
+  function ensureOutputs(node, nodeData) {
+    const types = nodeData?.output;
+    if (!node || !Array.isArray(types) || !Array.isArray(node.outputs)) return;
+    if (node.outputs.length >= types.length) return;
+    const names = nodeData.output_name || [];
+    while (node.outputs.length < types.length) {
+      const i = node.outputs.length;
+      node.addOutput(String(names[i] || `out${i}`), types[i] || "IMAGE", {});
+    }
+  }
+
   /**
    * 自动连续：后端每跑完一段发一次这个事件。
    *
@@ -1873,12 +2777,25 @@ if (app && api) {
    * `dogking-tools.next` —— 两个节点同时在工作流里时不会互相排队。
    */
   let pendingContinue = false;
+  let pendingNodeKey = "";
   api.addEventListener(EVENT_NEXT, (e) => {
     pendingContinue = Boolean(e?.detail?.should_continue);
+    pendingNodeKey = String(e?.detail?.node ?? "");
   });
   api.addEventListener("execution_success", () => {
     if (!pendingContinue) return;
     pendingContinue = false;
+
+    // 🔴 自动连续提交的是**当前界面**的图，不是刚跑完的那一份。
+    // 用户跑到一半换项目（换音频）或者重新等分，这时候再自动排，就会拿新参数
+    // 去跑「上一段的下一段」—— 两个项目的段数、参考图、提示词全串在一起。
+    // 所以先比对指纹：界面上还是刚跑的那一套才继续，否则停下来让人自己点。
+    const panel = findNodeByKey(pendingNodeKey)?.dkAudio;
+    if (panel && panel.lastSig && panel.executionSignature() !== panel.lastSig) {
+      panel.flash("界面参数已改动（换了音频或重新分段），自动连续已暂停 —— 点运行继续");
+      return;
+    }
+
     setTimeout(() => {
       try {
         app.queuePrompt(0, 1);

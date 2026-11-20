@@ -21,3 +21,7 @@ Thumbs.db
 *.log
 .vscode/
 .idea/
+
+# 本地回滚备份，不入库
+*.bak-*
+*.bak

@@ -36,6 +36,20 @@ FILTER_AUDIO = (
 )
 TITLE_AUDIO = "选择音频文件（wav / mp3 / flac / ogg / m4a）"
 
+FILTER_IMAGE = (
+    "图片文件\0*.png;*.jpg;*.jpeg;*.webp;*.bmp;*.tif;*.tiff\0"
+    "PNG (*.png)\0*.png\0"
+    "JPEG (*.jpg;*.jpeg)\0*.jpg;*.jpeg\0"
+    "所有文件 (*.*)\0*.*\0\0"
+)
+TITLE_IMAGE = "选择参考图（可按住 Ctrl 一次多选）"
+
+
+# 缩略图内存缓存：key = (路径, mtime, 大小, 边长)。
+# 面板每次重画都会请求同一批图，不缓存的话每拖一下节点就重新解码一遍原图。
+_THUMB_CACHE = {}
+_THUMB_CACHE_MAX = 96
+
 
 # ---------------------------------------------------------------- 文件选择框
 
@@ -113,6 +127,109 @@ def _ask_file_windows(filter_str=FILTER_PROMPT, title=TITLE_PROMPT, default_ext=
         # 0 = 用户点了取消，或调用失败
         return ""
     return buf.value or ""
+
+
+def _ask_images_windows(max_files=6):
+    """
+    Windows 原生「打开文件」对话框，**只能选图片、且支持一次多选**。
+
+    为什么不复用 `_ask_file_windows`：多选的结果格式完全不一样 ——
+    Windows 写的是 `目录\\0文件1\\0文件2\\0\\0`，`.value` 在第一个 \\0 就截断了，
+    必须拿整个 buffer 再切。另外带 OFN_ALLOWMULTISELECT 时缓冲区不够会**静默丢文件**，
+    所以这里给 32K。
+
+    参考图一次要 6 张，分 6 次点、每次都重新导航到同一目录，实际用起来没人受得了。
+
+    @returns {list} 选中的绝对路径，最多 `max_files` 个；取消返回空列表
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class OPENFILENAMEW(ctypes.Structure):
+        _fields_ = [
+            ("lStructSize", wintypes.DWORD),
+            ("hwndOwner", wintypes.HWND),
+            ("hInstance", wintypes.HINSTANCE),
+            ("lpstrFilter", wintypes.LPCWSTR),
+            ("lpstrCustomFilter", wintypes.LPWSTR),
+            ("nMaxCustFilter", wintypes.DWORD),
+            ("nFilterIndex", wintypes.DWORD),
+            ("lpstrFile", wintypes.LPWSTR),
+            ("nMaxFile", wintypes.DWORD),
+            ("lpstrFileTitle", wintypes.LPWSTR),
+            ("nMaxFileTitle", wintypes.DWORD),
+            ("lpstrInitialDir", wintypes.LPCWSTR),
+            ("lpstrTitle", wintypes.LPCWSTR),
+            ("Flags", wintypes.DWORD),
+            ("nFileOffset", wintypes.WORD),
+            ("nFileExtension", wintypes.WORD),
+            ("lpstrDefExt", wintypes.LPCWSTR),
+            ("lCustData", wintypes.LPARAM),
+            ("lpfnHook", wintypes.LPVOID),
+            ("lpTemplateName", wintypes.LPCWSTR),
+            ("pvReserved", wintypes.LPVOID),
+            ("dwReserved", wintypes.DWORD),
+            ("FlagsEx", wintypes.DWORD),
+        ]
+
+    buf = ctypes.create_unicode_buffer(32768)
+    ofn = OPENFILENAMEW()
+    ofn.lStructSize = ctypes.sizeof(OPENFILENAMEW)
+
+    user32 = ctypes.windll.user32
+    hwnd = user32.GetForegroundWindow()
+    if hwnd:
+        try:
+            user32.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+    ofn.hwndOwner = hwnd or None
+
+    ofn.lpstrFilter = FILTER_IMAGE
+    ofn.lpstrFile = ctypes.cast(buf, ctypes.c_wchar_p)
+    ofn.nMaxFile = 32768
+    ofn.lpstrTitle = TITLE_IMAGE
+    ofn.lpstrDefExt = ""
+    # OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR
+    # | OFN_ALLOWMULTISELECT
+    ofn.Flags = 0x00080000 | 0x00001000 | 0x00000800 | 0x00000008 | 0x00000200
+
+    if not ctypes.windll.comdlg32.GetOpenFileNameW(ctypes.byref(ofn)):
+        return []
+
+    parts = [p for p in buf[:].split("\0") if p]
+    if not parts:
+        return []
+    if len(parts) == 1:
+        # 只选了一张：整条就是完整路径
+        return parts[:1]
+    folder, names = parts[0], parts[1:]
+    picked = [os.path.join(folder, name) for name in names]
+    return picked[: max(1, int(max_files))]
+
+
+def _ask_images_tk(max_files=6):
+    """非 Windows 兜底：tkinter 的多选对话框。"""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError("当前环境没有 tkinter：%s" % e)
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    try:
+        files = filedialog.askopenfilenames(
+            title=TITLE_IMAGE,
+            filetypes=[("图片文件", "*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff"), ("所有文件", "*.*")],
+        )
+        return list(files)[: max(1, int(max_files))]
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
 
 
 def _ask_file_tk(filter_str=FILTER_PROMPT, title=TITLE_PROMPT):
@@ -309,6 +426,46 @@ async def select_audio(request):
         _dialog_busy.release()
 
 
+async def select_images(request):
+    """
+    弹系统原生文件选择框（只列图片，**支持一次多选**），返回路径列表。
+
+    body: {"max": 6} —— 最多收几张；不传按 6 张（音频分段节点的参考图槽位数）。
+
+    多选是这个功能的刚需：6 张图分 6 次点、每次都要重新导航到同一目录，
+    实际用起来没人受得了。_dialog_busy 和音频 / 提示词选择框共用 ——
+    同时点两处也只会弹一个框。
+    """
+    global _dialog_busy
+    if not _dialog_busy.acquire(blocking=False):
+        return web.json_response({"paths": [], "error": "已经有一个选择框开着，先关掉它"})
+
+    try:
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        try:
+            limit = int(body.get("max") or 6)
+        except (TypeError, ValueError):
+            limit = 6
+        limit = max(1, min(limit, 24))
+
+        if sys.platform == "win32":
+            loop = asyncio.get_running_loop()
+            paths = await loop.run_in_executor(None, lambda: _ask_images_windows(limit))
+        else:
+            paths = _ask_images_tk(limit)
+        return web.json_response({"paths": paths or []})
+    except Exception as e:  # noqa: BLE001
+        return web.json_response({"paths": [], "error": str(e)})
+    finally:
+        _dialog_busy.release()
+
+
 async def audio_peaks(request):
     """
     解码音频并返回画波形用的峰值数组。
@@ -383,6 +540,87 @@ async def audio_file(request):
     ext = os.path.splitext(resolved)[1].lower()
     if ext not in AUDIO_EXTENSIONS:
         return web.json_response({"ok": False, "error": "只允许音频文件：%s" % ext}, status=403)
+
+    # FileResponse 会自己处理 Range / ETag / Content-Length
+    return web.FileResponse(resolved)
+
+
+def _thumb_bytes(path, size=192):
+    """
+    生成缩略图字节（JPEG）。失败返回 None。
+
+    为什么服务端做：参考图可能是 6000×4000、20MB 的相机原图，面板上只画 56px。
+    让浏览器去下原图，6 个槽位就是 100MB 的解码量，拖一下节点卡三秒。
+    缓存按 (路径, mtime, 大小) 做 key —— 用户在外面换了同名文件时 mtime 会变，
+    不会一直拿旧图。
+    """
+    import io
+
+    try:
+        stat = os.stat(path)
+        key = (path, stat.st_mtime_ns, stat.st_size, int(size))
+    except OSError:
+        return None
+
+    hit = _THUMB_CACHE.get(key)
+    if hit:
+        return hit
+
+    try:
+        from PIL import Image
+
+        img = Image.open(path).convert("RGB")
+        img.thumbnail((int(size), int(size)), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=82)
+        data = buf.getvalue()
+    except Exception:  # noqa: BLE001
+        return None
+
+    if len(_THUMB_CACHE) > _THUMB_CACHE_MAX:
+        _THUMB_CACHE.clear()
+    _THUMB_CACHE[key] = data
+    return data
+
+
+async def image_file(request):
+    """
+    把本机图片当 HTTP 资源吐出去（面板缩略图 / 预览用）。
+
+    query: path=<绝对路径 或 input 目录下的相对路径>
+           thumb=1 → 返回 192px 的 JPEG 缩略图，不传就返回原图
+    返回: 二进制
+
+    和 audio_file 同款理由：面板里拿不到本地路径，`file://` 又被浏览器拦，
+    从系统选择框选的是任意位置的绝对路径，只能由后端读出来转发。
+    安全上只放行图片扩展名。
+    """
+    path = request.query.get("path", "")
+    want_thumb = request.query.get("thumb", "") not in ("", "0", "false", "no")
+
+    from .audio_split import IMAGE_EXTENSIONS, resolve_image_path
+
+    resolved = resolve_image_path(path)
+    if not resolved:
+        return web.json_response(
+            {"ok": False, "error": "找不到图片：%s" % (path or "(空)")}, status=404
+        )
+
+    ext = os.path.splitext(resolved)[1].lower()
+    if ext not in IMAGE_EXTENSIONS:
+        return web.json_response(
+            {"ok": False, "error": "只允许图片文件：%s" % ext}, status=403
+        )
+
+    if want_thumb:
+        loop = asyncio.get_running_loop()
+        data = await loop.run_in_executor(None, _thumb_bytes, resolved)
+        if data:
+            return web.Response(
+                body=data,
+                content_type="image/jpeg",
+                headers={"Cache-Control": "max-age=300"},
+            )
 
     # FileResponse 会自己处理 Range / ETag / Content-Length
     return web.FileResponse(resolved)
@@ -753,6 +991,9 @@ def register_routes():
     _ROUTES.post("/dogking-tools/select_audio")(select_audio)
     _ROUTES.post("/dogking-tools/audio_peaks")(audio_peaks)
     _ROUTES.get("/dogking-tools/audio_file")(audio_file)
+    # 参考图：多选对话框 + 缩略图/原图代理
+    _ROUTES.post("/dogking-tools/select_images")(select_images)
+    _ROUTES.get("/dogking-tools/image_file")(image_file)
     _ROUTES.post("/dogking-tools/count")(count)
     _ROUTES.post("/dogking-tools/list_images")(list_images)
     _ROUTES.post("/dogking-tools/reset")(reset)
