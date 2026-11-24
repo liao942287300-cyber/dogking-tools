@@ -83,6 +83,15 @@ _register_node_module("aspect_size", "同比例定尺寸")
 # 模块文件保留，需要回滚时把下面一行放开即可。
 # _register_node_module("guide_noise", "续接引导加噪")
 
+# 零拷贝裁帧补丁：把官方 ImageFromBatch 的 .clone() 去掉。
+# 二采 800x1440 一段 30 秒 = 720 帧 ≈ 9.95GB，clone 再要一份 → 48G 内存也顶不住。
+# 不需要时设环境变量 DOGKING_NO_SLICE_PATCH=1 即可关掉。
+try:
+    from .fast_slice import apply as _apply_fast_slice
+    _apply_fast_slice()
+except Exception as e:
+    print(f"[dogking-tools] 零拷贝裁帧补丁加载失败：{e}")
+
 WEB_DIRECTORY = "./web"
 
 # 注册后端接口（文件选择 / 行数预览 / 重置计数 / PromptVault 代转）
