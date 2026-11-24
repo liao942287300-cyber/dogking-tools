@@ -12,6 +12,7 @@ classifiers = [
 [project.urls]
 Repository = "https://github.com/liao942287300-cyber/dogking-tools"
 "Bug Tracker" = "https://github.com/liao942287300-cyber/dogking-tools/issues"
+PromptVault = "https://github.com/liao942287300-cyber/prompt-vault"
 
 [tool.comfy]
 PublisherId = "liao942287300-cyber"

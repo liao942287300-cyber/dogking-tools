@@ -4,8 +4,12 @@
 ![ComfyUI](https://img.shields.io/badge/ComfyUI-custom%20node-green)
 ![Python](https://img.shields.io/badge/python-3.10%2B-yellow)
 
-ComfyUI 提示词/图片批量加载节点。读 PromptVault（或任何工具）导出的 `.txt` / `.csv`，
-按行输出提示词；也可以按顺序读一整个文件夹的图片，配合自动排队实现
+> **配套应用：[PromptVault](https://github.com/liao942287300-cyber/prompt-vault)**
+> 离线图片提示词管理台 —— 纯原生 HTML/CSS/ES Module，零依赖，数据全存本地 IndexedDB。
+> 本插件的「PromptVault 数据源」节点就是直连它。
+
+ComfyUI 提示词/图片批量加载节点。读 [PromptVault](https://github.com/liao942287300-cyber/prompt-vault)
+（或任何工具）导出的 `.txt` / `.csv`，按行输出提示词；也可以按顺序读一整个文件夹的图片，配合自动排队实现
 **一条提示词（或一张图）跑一遍完整工作流**。
 
 另外还有 4 个 **PromptVault 数据源节点**，不用导出文件，直接从 PromptVault 桌面应用实时拉
