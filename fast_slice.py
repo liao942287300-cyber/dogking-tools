@@ -28,11 +28,22 @@ VAE 解码出来的源批次本身已经占 9.95GB，clone 又要一份同样大
 只读不写。视图会引用源批次，而源批次本来就要活到裁帧结束，所以实际占用
 只会少一份整段拷贝，不会多。
 
+改的是谁
+--------------------------------------------------------------------------
+改的是**进程内存里的类对象**：ComfyUI 启动时把 comfy_extras/nodes_images.py
+读进来，我们在插件加载阶段把 `ImageFromBatch.execute` 这个 classmethod
+换成等价实现。磁盘上的官方文件一个字节都不动：
+
+  * ComfyUI 升级 / 重装 / 校验文件完整性 → 不受影响，重装后还是原版；
+  * 想回滚 → 删掉本文件、或设 DOGKING_NO_SLICE_PATCH=1，重启即可；
+  * 官方哪天改了实现（源码里没有 `.clone()` 了）→ 我们不介入，直接跳过。
+
 关掉这个补丁
 --------------------------------------------------------------------------
 把 `ENABLE` 改成 False，或设环境变量 `DOGKING_NO_SLICE_PATCH=1`。
 """
 
+import inspect
 import os
 
 ENABLE = os.environ.get("DOGKING_NO_SLICE_PATCH", "") not in ("1", "true", "True", "yes")
@@ -40,14 +51,29 @@ ENABLE = os.environ.get("DOGKING_NO_SLICE_PATCH", "") not in ("1", "true", "True
 _APPLIED = False
 
 
-def _build_execute(IO):
+def _build_execute(IO, orig):
     """
     生成替换用的 execute。
 
+    两处防御，保证官方节点以后怎么改都不会被我们带崩：
+
+      ① 参数形状不对（官方加了新参数 / 换了名字）→ 原样交回官方实现
+      ② image 不是 4 维 IMAGE → 同样交回官方实现
+
     @param {module} IO comfy_api.latest.IO（需要 NodeOutput）
-    @returns {callable} 与官方同签名的函数
+    @param {callable} orig 官方未绑定的 execute 函数
+    @returns {callable} 替换用的函数
     """
-    def execute(cls, image, batch_index, length):
+    def execute(cls, *args, **kwargs):
+        try:
+            image = args[0] if len(args) > 0 else kwargs["image"]
+            batch_index = args[1] if len(args) > 1 else kwargs["batch_index"]
+            length = args[2] if len(args) > 2 else kwargs["length"]
+        except (IndexError, KeyError):
+            return orig(cls, *args, **kwargs)
+        if len(args) > 3 or not hasattr(image, "dim") or image.dim() != 4:
+            return orig(cls, *args, **kwargs)
+
         s_in = image
         if batch_index < 0:
             batch_index += s_in.shape[0]
@@ -59,9 +85,25 @@ def _build_execute(IO):
     return execute
 
 
+def _looks_like_official(func):
+    """
+    官方实现里必须有 `.clone()`。没有就说明上游已经改过（或换了实现），
+    这时候不介入 —— 宁可让用户吃一次 OOM，也不要把不明实现替换成我们的。
+    """
+    try:
+        src = inspect.getsource(func)
+    except (OSError, TypeError):
+        return False
+    return ".clone()" in src
+
+
 def apply():
     """
     给 comfy_extras 的 ImageFromBatch 打上零拷贝补丁（只打一次）。
+
+    注意：改的是**运行中的类对象**，磁盘上的 comfy_extras/nodes_images.py
+    一个字节都没动。ComfyUI 升级/重装不会带着这个改动，删掉本文件或
+    关掉 ENABLE 就恢复官方行为。
 
     @returns {bool} 本次是否真的替换了
     """
@@ -79,12 +121,18 @@ def apply():
     if cls is None or getattr(cls, "_dogking_zero_copy", False):
         return False
 
-    execute = _build_execute(IO)
+    orig = cls.execute.__func__
+    if not _looks_like_official(orig):
+        print("[dogking-tools] ImageFromBatch 实现和预期不同，零拷贝补丁不介入")
+        return False
+
+    execute = _build_execute(IO, orig)
     cls.execute = classmethod(execute)
     cls.frombatch = classmethod(execute)          # 旧别名，部分代码仍按这个名字取
     cls._dogking_zero_copy = True
     _APPLIED = True
-    print("[dogking-tools] ImageFromBatch 已切到零拷贝：裁帧不再复制整段画面")
+    print("[dogking-tools] ImageFromBatch 已切到零拷贝（仅运行时替换，官方文件未改动）："
+          "裁帧不再复制整段画面")
     return True
 
 

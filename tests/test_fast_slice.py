@@ -34,8 +34,24 @@ class _FakeNodeOutput:
         self.result = args
 
 
-def _install_fakes():
-    """造一个和官方同构的 ImageFromBatch（带 clone），供补丁替换。"""
+class _ChangedOfficialBatch:
+    """模拟「官方改了实现」：源码里没有 .clone()，补丁应该主动放弃。"""
+
+    @classmethod
+    def execute(cls, image, batch_index, length):
+        n = image.shape[0]
+        start = batch_index + n if batch_index < 0 else batch_index
+        start = max(0, min(n - 1, start))
+        return _FakeNodeOutput(image[start:start + min(n - start, length)])
+
+
+def _install_fakes(changed=False):
+    """
+    造一个和官方同构的 ImageFromBatch 供补丁替换。
+
+    @param {bool} changed True 时换成一个「官方已经改过实现」的版本，
+                          用来验证护栏会让补丁主动放弃。
+    """
     class _OfficialImageFromBatch:
         @classmethod
         def execute(cls, image, batch_index, length):
@@ -50,7 +66,7 @@ def _install_fakes():
         frombatch = execute
 
     mod_ni = types.ModuleType("comfy_extras.nodes_images")
-    mod_ni.ImageFromBatch = _OfficialImageFromBatch
+    mod_ni.ImageFromBatch = _ChangedOfficialBatch if changed else _OfficialImageFromBatch
 
     mod_ce = types.ModuleType("comfy_extras")
     mod_ce.nodes_images = mod_ni
@@ -144,5 +160,20 @@ def test_disable(monkeypatch):
         assert m.apply() is False
         assert ni.ImageFromBatch.execute.__func__ is before
         assert m.is_applied() is False
+    finally:
+        _restore(saved)
+
+
+# ---------------------------------------------------------------- ⑤ 官方改了就收手
+
+def test_guard_skips_unknown_impl():
+    """官方源码里已经没有 .clone()（改过实现）时，补丁必须放弃，不能瞎替。"""
+    ni, saved = _install_fakes(changed=True)
+    try:
+        before = ni.ImageFromBatch.execute.__func__
+        m = _load("fast_slice", "dk_fast_slice_guard_for_test")
+        assert m.apply() is False
+        assert ni.ImageFromBatch.execute.__func__ is before
+        assert not getattr(ni.ImageFromBatch, "_dogking_zero_copy", False)
     finally:
         _restore(saved)
