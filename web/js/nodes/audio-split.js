@@ -609,8 +609,36 @@ function readRefConfig(raw) {
   };
 }
 
-/** 参考图缩略图地址（走后端代理；本机绝对路径浏览器读不到） */
-function refThumbUrl(path) {
+/**
+ * 从 `node.widgets_values` 里捞一份「像参考图配置」的 JSON。
+ *
+ * 为什么要这层自救（2026-11-24）：ComfyUI 存盘按 widget 顺序写、读盘按参数顺序填，
+ * 老版本把「音频」放在参考图数据前面，两边错开一格 —— 参考图 JSON 被填进没有 widget
+ * 的音频槽位（丢弃），参考图数据读到空串。后端已经把音频挪到末尾修好，但**已经被
+ * 存坏的工作流**文件里那串 JSON 还在数组里，这里把它捞回来，用户不用重新选图。
+ *
+ * 判定要严：分段数据里也有 `"images"`（每段自己的参考图），不能误抓 ——
+ * 参考图配置有 short 且没有 segments。
+ */
+function findRefConfigInValues(node) {
+  const arr = node?.widgets_values;
+  if (!Array.isArray(arr)) return "";
+  for (const v of arr) {
+    if (typeof v !== "string" || v.indexOf('"images"') < 0) continue;
+    try {
+      const d = JSON.parse(v);
+      if (d && typeof d === "object" && !Array.isArray(d) &&
+          Array.isArray(d.images) && !Array.isArray(d.segments)) {
+        return v;
+      }
+    } catch (err) {
+      /* 不是 JSON，跳过 */
+    }
+  }
+  return "";
+}
+
+/** 参考图缩略图地址（走后端代理；本机绝对路径浏览器读不到） */function refThumbUrl(path) {
   const base = `/dogking-tools/image_file?thumb=1&path=${encodeURIComponent(path)}`;
   // ComfyUI 可能挂在子路径下，和试听音频一样过一遍 apiURL
   return typeof api?.apiURL === "function" ? api.apiURL(base) : base;
@@ -2632,7 +2660,17 @@ class AudioSplitPanel {
 
     // 全局参考图 + 短边限制。老工作流没这个字段时读出来是「0 张 + 1024」，
     // 面板照常打开、只是没有图。
-    const refCfg = readRefConfig(this.readWidget("参考图数据"));
+    // 另外：老版本存盘槽位错位会把这段 JSON 甩到别的格子里，widget 读出来是空串 ——
+    // 空的时候再从 widgets_values 里捞一次，捞到就写回去（下次存盘就正常了）。
+    let rawRef = this.readWidget("参考图数据");
+    if (!String(rawRef || "").trim()) {
+      const healed = findRefConfigInValues(this.node);
+      if (healed) {
+        rawRef = healed;
+        this.writeWidget("参考图数据", healed);
+      }
+    }
+    const refCfg = readRefConfig(rawRef);
     this.globalRefs = refCfg.images;
     this.refShort = refCfg.short;
     this.refOpen = -1;
@@ -2714,7 +2752,7 @@ if (app && api) {
         }
 
         const mount = document.createElement("div");
-        node.addDOMWidget("音频分段", "dkAudioSplit", mount, {
+        const panelWidget = node.addDOMWidget("音频分段", "dkAudioSplit", mount, {
           serialize: false,
           hideOnZoom: false,
           // 🔴 必须是常量。动态 getHeight（按节点高度补差值）会和拖拽缩放形成
@@ -2724,6 +2762,12 @@ if (app && api) {
           getValue: () => "",
           setValue: () => {},
         });
+
+        // 🔴 这一刀不能省（2026-11-24 实测）：新版前端只认 `widget.serialize`，
+        // 不认 options 里的 `serialize: false`。不补的话存盘会在 widgets_values
+        // 末尾多写一格空串，前端迁移函数按「音频 forceInput 占一格」往回对，
+        // 正好把「参考图数据」挤到那格空串上 —— 表现就是**一切换工作流参考图全没了**。
+        if (panelWidget) panelWidget.serialize = false;
 
         node.dkAudio = new AudioSplitPanel(node, mount);
 

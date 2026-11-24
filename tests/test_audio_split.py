@@ -732,3 +732,23 @@ def test_result_carries_frame_plan():
     assert valid == 48                     # 2 秒 × 24
     assert gen == 107                      # 48 → 对齐 56；56+39 = 95 → 对齐 107
     assert r[12:] == (None,) * 6           # 没设参考图 → 6 个图片口全是 None
+
+
+# ---------------------------------------------------------------- ⑤ 参数槽位
+
+def test_ref_widget_is_last_widget():
+    """
+    「参考图数据」必须是最后一个**有 widget** 的参数，后面只允许跟 forceInput。
+
+    为什么死守这一条（2026-11-24 实测）：ComfyUI 存盘按 widget 顺序写
+    widgets_values，读盘却按 INPUT_TYPES 的参数顺序往回填 —— 连 forceInput 的
+    「音频」也占一格。两边错开一位，参考图 JSON 就被塞进没有 widget 的音频槽位
+    （值直接丢弃），参考图数据读到空串，表现是「一切换工作流参考图全没了」。
+    """
+    t = _av.DogkingAudioSplit.INPUT_TYPES()
+    names = list(t["required"]) + list(t["optional"])
+    assert "参考图数据" in names
+    idx = names.index("参考图数据")
+    tail = names[idx + 1:]
+    assert tail == ["音频"], "参考图数据后面只允许放 forceInput 的音频，现在多了 %r" % (tail,)
+    assert t["optional"]["音频"][1].get("forceInput") is True

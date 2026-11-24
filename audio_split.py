@@ -760,17 +760,19 @@ class DogkingAudioSplit:
                 }),
             },
             "optional": {
-                "音频": ("AUDIO", {
-                    "forceInput": True,
-                    "tooltip": "上游给的音频；接了就用它，忽略「文件路径」",
-                }),
                 # 全局参考图 + 短边限制。被面板改成隐藏类型，节点上不占 widget 行：
                 # 存 `{"short": 1024, "images": ["C:/a.png", ...]}`，
                 # 面板把它画成 6 个缩略图槽位 + 一个「短边」输入框。
                 #
-                # 🔴 必须放在**最后**：ComfyUI 的 widgets_values 是按位置存的，
-                # 在中间插一个新 widget 会让老工作流的每一个值都往后错一位
-                # （提示词变成输出模式、段号变成布尔值……）。放尾部就只是多一位。
+                # 🔴 位置规则（2026-11-24 实测，别动）：
+                # **它必须是最后一个「有 widget 的参数」，后面只能跟 forceInput。**
+                #
+                # 存盘和读盘用的不是同一套顺序：
+                #   存盘 = 按 widget 顺序写 widgets_values（DOM widget 也算一格）
+                #   读盘 = 按 INPUT_TYPES 的参数顺序往回填（连 forceInput 的「音频」也占一格）
+                # 只要两边错开一位，参考图 JSON 就被填进「音频」——它没有 widget，
+                # 值直接丢弃；「参考图数据」读到的是空格位。表现就是
+                # **一切换工作流，参考图全没了**（面板显示 6 个空槽）。
                 "参考图数据": ("STRING", {
                     "default": "",
                     # 同理：单行。这个值虽然短（一两百字符），但一旦上了 6 张图
@@ -778,6 +780,13 @@ class DogkingAudioSplit:
                     "multiline": False,
                     "dynamicPrompts": False,
                     "tooltip": "内部字段：面板生成的 {short:1024, images:[路径…]}，不用手改",
+                }),
+                # 🔴 「音频」必须排在参考图数据**后面**：它 forceInput、没有 widget，
+                # 只在读盘时占一格。让它去接存盘时 DOM widget 留下的那个空串，
+                # 两边下标就对齐了（参考图落在第 8 位，音频吃第 9 位的空串）。
+                "音频": ("AUDIO", {
+                    "forceInput": True,
+                    "tooltip": "上游给的音频；接了就用它，忽略「文件路径」",
                 }),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
